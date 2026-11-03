@@ -440,9 +440,14 @@ fn anthropic_models_view(body: &Value) -> Value {
 ///
 /// Anthropic 的官方契约里这是**独立端点**（Claude Code 启动时会探它）。
 /// 真正的分词只有上游知道，而本项目六家上游都没有对应的 tokenizer 接口 ——
-/// 所以这里给一个**估算**并如实标注 `estimated: true`：
-/// 按「字符数 ÷ 3.5」估（中英混排的经验值，与 Anthropic 官方「约 3.5 字符
-/// 一个 token」的量级一致）。
+/// 所以这里给一个**估算**并如实标注 `estimated: true`（口径见
+/// `core::protocol::estimate`：CJK 约 1.5 字符 / token、其余约 4 字符 / token）。
+///
+/// ── 为什么和流式首帧共用同一个估算器 ────────────────────────
+/// `/v1/messages` 流式响应的 `message_start` 也只能给估算（真实 usage 在上游
+/// 收尾帧里才到，见 `core::protocol::estimate` 的模块头）。两处若各用一套
+/// 系数，同一个请求在 context 预算与消息 usage 上会给出两个数 —— Claude Code
+/// 会同时读这两处，读数打架比数字略粗更糟。
 ///
 /// ── 为什么不直接 404 ────────────────────────────────────────
 /// Claude Code 在网关模式下会调它做上下文预算；404 会让它按「网关不支持」
@@ -456,12 +461,11 @@ pub async fn count_tokens(State(state): State<ServerState>, body: Bytes) -> Resp
     };
     // 复用 Anthropic → Chat 的转换来统计：这样「工具定义 / 图片块 / system」
     // 的文本都被算进去，口径与真正转发时一致（转换失败则按原始 JSON 估）
-    let text = match crate::server::core::protocol::anthropic::chat_from_anthropic(&payload) {
-        Ok(chat) => serde_json::to_string(&chat).unwrap_or_default(),
-        Err(_) => serde_json::to_string(&payload).unwrap_or_default(),
+    let chat = match crate::server::core::protocol::anthropic::chat_from_anthropic(&payload) {
+        Ok(chat) => chat,
+        Err(_) => payload.clone(),
     };
-    let characters = text.chars().count();
-    let tokens = ((characters as f64) / 3.5).ceil().max(1.0) as i64;
+    let tokens = crate::server::core::protocol::estimate::estimate_prompt_tokens(&chat);
     let _ = state;
     json_response(json!({
         "input_tokens": tokens,

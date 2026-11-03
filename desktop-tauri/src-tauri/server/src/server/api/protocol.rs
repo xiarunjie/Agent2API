@@ -35,7 +35,7 @@ use axum::response::Response;
 use serde_json::{json, Value};
 
 use crate::server::core::key_scope::KeyScope;
-use crate::server::core::protocol::{anthropic, responses};
+use crate::server::core::protocol::{anthropic, estimate, responses};
 use crate::server::core::upstream::cancellation;
 use crate::server::core::upstream::continuation::{self, Continuation};
 use crate::server::core::upstream::usage::RequestTelemetry;
@@ -370,6 +370,14 @@ pub async fn messages_endpoint(
     // 下游等级从**翻译后的 chat 体**读：Anthropic 的 thinking/output_config →
     // reasoning_effort 是网关自己的映射（anthropic_effort），比通用并集链更准
     let client_reasoning = pipeline::client_reasoning_of(&chat_body);
+    // 流式首帧（message_start）的输入 token 兜底：真实 usage 只在上游收尾帧
+    // 里到达，首帧只能给估算（口径见 `core::protocol::estimate` 的模块头）。
+    // 非流式走聚合器、能拿到真实 usage，不必估算 —— 也就不付这份遍历成本。
+    let input_tokens_hint = if stream {
+        estimate::estimate_prompt_tokens(&chat_body)
+    } else {
+        0
+    };
     let requested_model = match pipeline::resolve_model(&state, &mut chat_body, scope.as_ref()) {
         Ok(model) => model,
         Err(error) => {
@@ -457,7 +465,7 @@ pub async fn messages_endpoint(
             let model = requested_model.clone();
             let context = RecordContext { status: i64::from(status.as_u16()), ..context };
             if stream {
-                let mut machine = anthropic::AnthropicStream::new(&model);
+                let mut machine = anthropic::AnthropicStream::new(&model, input_tokens_hint);
                 let transformed = pipeline::transformed_stream(
                     source,
                     context,
