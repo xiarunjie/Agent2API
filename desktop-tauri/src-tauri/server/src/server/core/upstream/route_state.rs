@@ -187,23 +187,39 @@ impl RouteState {
         format!("{:016x}", hasher.finish())
     }
 
-    /// 显式会话标识的提取链（顺序即优先级，见 [`Self::conversation_key`]）。
+    /// 显式会话标识的提取链（顺序即优先级，见 [`Self::conversation_key`]）
+    /// 连同**来源标签**一起返回。
+    ///
+    /// **为什么值和标签必须同一处产出**：来源标签要落进绑定表（管理页展示）
+    /// 与日志（`identity-changed` 事件）。曾经它是另一个函数按同一份名单再判
+    /// 一遍的 —— 那种「两份判据」正是 issue #2 的形态：只要一侧漏掉某个键，
+    /// 就不会有任何报错，只是粘性静默失效。名单只有这一份。
     ///
     /// **端点无关**：同一套标识在不同协议端点上语义相同，按路径收窄反而会在
     /// 客户端换端点时丢掉同一个会话（上游的内容哈希同样是端点无关的）。
-    fn explicit_conversation_id(headers: &HeaderMap, body: &serde_json::Value) -> Option<String> {
+    fn explicit_conversation(
+        headers: &HeaderMap,
+        body: &serde_json::Value,
+    ) -> Option<(String, &'static str)> {
         // ① AxonHub 的**会话级**头。⚠️ 别换成 `AH-Trace-Id`：那个的粒度是
         // 「单条用户消息 + 它触发的所有请求」（AxonHub 的层级是 Thread → Trace
         // → Request），一个客户端每轮都会给它一个新值，拿它当会话键会让粘性
         // 逐轮断裂 —— 比下面那条内容哈希（跨轮稳定）还差。上游原实现读的正是
         // Trace，2026-10-14 订正为 Thread。
-        if let Some(value) = Self::header_text(headers, "ah-thread-id") {
-            return Some(value);
-        }
-        // ② OpenCode 系（三个头按新旧顺序）
-        for name in ["x-opencode-session", "x-session-id", "x-session-affinity"] {
+        //
+        // ② OpenCode 系：带 `x-` 前缀的三个在前（新旧顺序），再认不带前缀的
+        //    写法 —— 有的客户端或中间代理会把前缀去掉，语义与带前缀的完全相同；
+        //    排在带前缀的后面，带前缀的客户端行为因此逐字不变。
+        for (name, label) in [
+            ("ah-thread-id", "AH-Thread-Id"),
+            ("x-opencode-session", "X-Opencode-Session"),
+            ("x-session-id", "X-Session-Id"),
+            ("x-session-affinity", "X-Session-Affinity"),
+            ("opencode-session", "Opencode-Session"),
+            ("session-affinity", "Session-Affinity"),
+        ] {
             if let Some(value) = Self::header_text(headers, name) {
-                return Some(value);
+                return Some((value, label));
             }
         }
         // ③ OpenAI Chat 的 prompt_cache_key：**翻译网关这条路唯一的会话标识**。
@@ -229,7 +245,7 @@ impl RouteState {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            return Some(value.to_string());
+            return Some((value.to_string(), "prompt_cache_key"));
         }
         // ④ Claude Code：`metadata.user_id`（两种可辨认的形状，见
         // [`Self::parse_claude_code_user_id`]）。解析不出就当没有 —— 宁可没有
@@ -241,12 +257,12 @@ impl RouteState {
             .and_then(serde_json::Value::as_str)
             .and_then(Self::parse_claude_code_user_id)
         {
-            return Some(value);
+            return Some((value, "Claude Code"));
         }
         // ⑤ Codex：会话头，或 turn metadata 里的 session_id
         for name in ["session_id", "session-id"] {
             if let Some(value) = Self::header_text(headers, name) {
-                return Some(value);
+                return Some((value, "Session-Id"));
             }
         }
         if let Some(metadata) = headers
@@ -260,11 +276,16 @@ impl RouteState {
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                 {
-                    return Some(session.to_string());
+                    return Some((session.to_string(), "X-Codex-Turn-Metadata"));
                 }
             }
         }
         None
+    }
+
+    /// 只要值的那一半（其余调用方不关心来源标签）。
+    fn explicit_conversation_id(headers: &HeaderMap, body: &serde_json::Value) -> Option<String> {
+        Self::explicit_conversation(headers, body).map(|(value, _)| value)
     }
 
     /// 头值读取：缺失 / 非 ASCII 一律当「没有」（不做 URL 解码等额外处理）。
@@ -343,26 +364,18 @@ impl RouteState {
         self.sticky.clear(id, model)
     }
 
+    /// 会话键的**来源标签**（落进绑定表与管理日志，回答「这条绑定是从哪个
+    /// 字段来的」）。
+    ///
+    /// 与 [`Self::explicit_conversation`] 同一条链：这里不再另写一份名单 ——
+    /// 两份判据漂移正是「写入与查找各读一个字段」那类静默失效的来源。
     pub(super) fn conversation_source(headers: &HeaderMap, body: &serde_json::Value) -> &'static str {
-        if Self::explicit_conversation_id(headers, body)
-            .is_none_or(|value| value.chars().count() > Self::EXPLICIT_ID_MAX_CHARS)
-        {
-            return "content-hash";
+        match Self::explicit_conversation(headers, body) {
+            // 与 `conversation_key` 的长度闸同一判据：超长的显式标识按内容哈希
+            // 处理，来源也就必须如实写成内容哈希。
+            Some((value, label)) if value.chars().count() <= Self::EXPLICIT_ID_MAX_CHARS => label,
+            _ => "content-hash",
         }
-        for (name, label) in [
-            ("ah-thread-id", "AH-Thread-Id"),
-            ("x-opencode-session", "X-Opencode-Session"),
-            ("x-session-id", "X-Session-Id"),
-            ("x-session-affinity", "X-Session-Affinity"),
-        ] {
-            if Self::header_text(headers, name).is_some() { return label; }
-        }
-        if body.get("prompt_cache_key").and_then(serde_json::Value::as_str)
-            .is_some_and(|key| !key.trim().is_empty()) { return "prompt_cache_key"; }
-        if body.pointer("/metadata/user_id").and_then(serde_json::Value::as_str)
-            .and_then(Self::parse_claude_code_user_id).is_some() { return "Claude Code"; }
-        if Self::explicit_conversation_id(headers, body).is_some() { return "Codex"; }
-        "content-hash"
     }
 
     /// 取轮转游标并前进一格，返回**计数** —— 取模交给调用方做。
@@ -618,6 +631,9 @@ mod tests {
             (headers(&[("x-opencode-session", "sess-opencode")]), body.clone(), "id:sess-opencode"),
             (headers(&[("x-session-id", "sess-x")]), body.clone(), "id:sess-x"),
             (headers(&[("x-session-affinity", "sess-affinity")]), body.clone(), "id:sess-affinity"),
+            // 不带 `x-` 前缀的写法（有的客户端/代理会去掉前缀）
+            (headers(&[("opencode-session", "sess-opencode-bare")]), body.clone(), "id:sess-opencode-bare"),
+            (headers(&[("session-affinity", "sess-affinity-bare")]), body.clone(), "id:sess-affinity-bare"),
             (headers(&[("session-id", "sess-codex")]), body.clone(), "id:sess-codex"),
             (
                 headers(&[("x-codex-turn-metadata", "{\"session_id\":\"sess-turn\"}")]),
@@ -634,6 +650,50 @@ mod tests {
         for (headers, body, expected) in &cases {
             assert_eq!(RouteState::conversation_key(headers, body), *expected);
         }
+    }
+
+    /// 来源标签与提取链必须同源：每条能产生显式键的输入，`conversation_source`
+    /// 都不得报成 `content-hash`。
+    ///
+    /// 钉的是 issue #2 那类**静默失效**：写入侧与查找侧（或展示侧）各读一份
+    /// 名单，只要一侧漏了某个字段就不会报错 —— 只表现为「会话粘性看起来没生效」。
+    #[test]
+    fn the_reported_source_agrees_with_the_extracted_key() {
+        let body = chat_body();
+        let cases: Vec<(HeaderMap, serde_json::Value)> = vec![
+            (headers(&[("ah-thread-id", "thread-abc")]), body.clone()),
+            (headers(&[("x-opencode-session", "sess-opencode")]), body.clone()),
+            (headers(&[("x-session-id", "sess-x")]), body.clone()),
+            (headers(&[("x-session-affinity", "sess-affinity")]), body.clone()),
+            (headers(&[("opencode-session", "sess-opencode-bare")]), body.clone()),
+            (headers(&[("session-affinity", "sess-affinity-bare")]), body.clone()),
+            (headers(&[("session-id", "sess-codex")]), body.clone()),
+            (
+                headers(&[("x-codex-turn-metadata", "{\"session_id\":\"sess-turn\"}")]),
+                body.clone(),
+            ),
+            (HeaderMap::new(), json!({ "prompt_cache_key": "sess-cache" })),
+            (
+                HeaderMap::new(),
+                json!({ "metadata": { "user_id": "{\"session_id\":\"sess-claude\"}" } }),
+            ),
+        ];
+        for (headers, body) in &cases {
+            let key = RouteState::conversation_key(headers, body);
+            assert!(key.starts_with("id:"), "这些输入都该产生显式会话键");
+            assert_ne!(
+                RouteState::conversation_source(headers, body),
+                "content-hash",
+                "产生了显式键的输入，来源标签不该报成内容哈希"
+            );
+        }
+        // 对照：没有显式标识时两边都落在内容哈希上
+        let plain = RouteState::conversation_key(&HeaderMap::new(), &chat_body());
+        assert!(!plain.starts_with("id:"));
+        assert_eq!(
+            RouteState::conversation_source(&HeaderMap::new(), &chat_body()),
+            "content-hash"
+        );
     }
 
     /// 形状不对的 `metadata.user_id` 不该被当成会话 id —— 宁可没有粘性。
@@ -719,5 +779,58 @@ mod tests {
         state.sink_clear("a1");
         let snap = state.snapshot("", now, 0);
         assert!(!snap.sunk.contains_key("a1"), "成功后应当立刻解除垫底");
+    }
+
+    /// 粘性的**写入 → 查找**闭环（issue #2 的最小复现面）。
+    ///
+    /// `sticky_bind` 与 `snapshot_for_model` 必须用同一把键（会话键 + 请求模型），
+    /// 否则记录下来了也永远查不到 —— 而那种失败没有任何报错，只表现为
+    /// `route.stickyHit` 恒为 false。
+    #[test]
+    fn a_bound_session_is_found_by_the_next_lookup() {
+        let state = RouteState::new();
+        let now = 1_700_000_000_000i64;
+        let ttl = 6 * 60 * 60 * 1000;
+        let generation = state.sticky_generation();
+
+        // 写入侧（`attempt_queue` 成功出口那一份参数的形状）
+        state.sticky_bind("conv-key", "model-x", "acct-a", "content-hash", now, ttl, generation);
+
+        // 查找侧（`select_target_account` 的调用形状）
+        let hit = state.snapshot_for_model("conv-key", "model-x", now + 1, ttl);
+        assert_eq!(hit.sticky_hit.as_deref(), Some("acct-a"), "同一会话键必须查回绑定的账号");
+
+        // 键的两半都参与：换模型、换会话键都应当落空
+        assert!(state.snapshot_for_model("conv-key", "model-y", now + 1, ttl).sticky_hit.is_none());
+        assert!(state.snapshot_for_model("other-key", "model-x", now + 1, ttl).sticky_hit.is_none());
+
+        // TTL 到点自动失效（6 小时档）。注意 TTL 是**从最近一次使用**起算的：
+        // 上面那次命中把 `last_seen` 续到了 `now + 1`，所以要越过它再走一整段。
+        let expired = state.snapshot_for_model("conv-key", "model-x", now + 1 + ttl + 1, ttl);
+        assert!(expired.sticky_hit.is_none(), "超过会话粘性 TTL 后不该再命中");
+    }
+
+    /// 管理页读取**不得**用查询档位淘汰别人的绑定。
+    ///
+    /// 钉的是 2026-11 修的一处缺陷：`list()` 曾按调用方传进来的 TTL 清理整张表，
+    /// 于是「切到 auto（5 分钟）打开一次会话粘滞页」就会把 6 小时档的绑定全部
+    /// 清掉 —— 读一次管理页不该改变任何状态。
+    #[test]
+    fn reading_the_sticky_list_keeps_longer_lived_bindings() {
+        let state = RouteState::new();
+        let now = 1_700_000_000_000i64;
+        let session_ttl = 6 * 60 * 60 * 1000;
+        let auto_ttl = 5 * 60 * 1000;
+        let generation = state.sticky_generation();
+        state.sticky_bind("conv-key", "model-x", "acct-a", "content-hash", now, session_ttl, generation);
+
+        // 用更短的 auto 档看一眼列表：这条 6 小时档的绑定必须还在。
+        let listed = state.sticky_list(None, now + auto_ttl + 1, auto_ttl);
+        assert_eq!(listed.len(), 1, "读取列表不该淘汰 TTL 更长的绑定");
+        assert_eq!(listed[0]["remainingMs"], json!(session_ttl - auto_ttl - 1));
+
+        // 回 session 档查：仍然命中
+        let hit = state.snapshot_for_model("conv-key", "model-x", now + auto_ttl + 1, session_ttl);
+        assert_eq!(hit.sticky_hit.as_deref(), Some("acct-a"));
     }
 }
