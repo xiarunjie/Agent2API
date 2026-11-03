@@ -655,6 +655,32 @@ fn filter_by_key_scope(
     .with_code("model_not_found"))
 }
 
+/// 转发成功的「记住这个会话的承载账号」出口 —— **三条成功路径共用这一个**。
+///
+/// 抽出来的理由不是省几行：粘性的写入曾经在自定义提供商那条路径上整条漏掉
+/// （issue #2 / 上游 #443 —— v3.0.8 的 `attempt_custom` 成功分支里没有
+/// `sticky_bind`，自定义家转发的会话因此永远不粘，而请求日志里只看得到
+/// `stickyHit:false`、没有任何报错）。三条路径各写一遍 `sticky_bind`，就还会
+/// 有第四次的遗漏；写成唯一出口之后，「新增一条转发路径」与「粘性写没写」
+/// 不再需要靠人记着对上。
+///
+/// 判据（空会话键 / TTL 档位 / 清除代次）全部在 `StickySessions::bind` 里，
+/// 本函数只把「此刻的配置」换算成 TTL —— 与选路侧 `routing::sticky_ttl_ms`
+/// 同一来源，免得写与读各用一个档位。
+fn remember_session(
+    service: &UpstreamService,
+    conv_key: &str,
+    model: &str,
+    account_id: &str,
+    source: &str,
+    generation: u64,
+) {
+    let ttl = config::routing_settings().sticky.ttl_ms().unwrap_or(0);
+    service
+        .route
+        .sticky_bind(conv_key, model, account_id, source, logging::now_ms(), ttl, generation);
+}
+
 /// 账号循环：每一轮从候选池里按全局优先级选一个账号，用它所属家的适配器发一次。
 ///
 /// 按 `is_stateful` 分流（架构文档 §4.2.1）：
@@ -762,7 +788,15 @@ async fn attempt_queue(
         // 决策快照挂进 telemetry（最后一次为准：请求日志的「路由回放」显示
         // 的是最终承载那次选路的完整排序 —— 与 attempts 明细的换号链互补，
         // 那边回答「试了谁」，这边回答「当时为什么这么排」）。
-        if let Some(decision) = target.decision.clone() {
+        if let Some(mut decision) = target.decision.clone() {
+            // 会话键的**来源标签**（哪条提取链生效）：路由回放要能回答「这次
+            // 请求的会话键是哪个字段给的」。只记标签，不记原始键值。
+            if let Some(object) = decision.as_object_mut() {
+                object.insert(
+                    "stickySource".to_string(),
+                    Value::String(sticky_source.to_string()),
+                );
+            }
             ctx.telemetry.set_route_decision(decision);
         }
         // 连接计数改绑到这一轮选中的账号：失败重试换账号时计数跟着走，
@@ -781,9 +815,8 @@ async fn attempt_queue(
             match attempt_custom(service, ctx, target, slot, connections, degraded).await {
                 Ok(outcome) => {
                     if let Some(account_id) = custom_account_id.as_deref() {
-                        service.route.sticky_bind(
-                            &conv_key, &model, account_id, sticky_source, logging::now_ms(),
-                            config::routing_settings().sticky.ttl_ms().unwrap_or(0), sticky_generation,
+                        remember_session(
+                            service, &conv_key, &model, account_id, sticky_source, sticky_generation,
                         );
                         service.route.backoff_clear(account_id);
                         service.route.sink_clear(account_id);
@@ -929,9 +962,8 @@ async fn attempt_queue(
             {
                 Ok(outcome) => {
                     if let Some(account_id) = stateful_account_id.as_deref() {
-                        service.route.sticky_bind(
-                            &conv_key, &model, account_id, sticky_source, logging::now_ms(),
-                            config::routing_settings().sticky.ttl_ms().unwrap_or(0), sticky_generation,
+                        remember_session(
+                            service, &conv_key, &model, account_id, sticky_source, sticky_generation,
                         );
                         service.route.backoff_clear(account_id);
                         service.route.sink_clear(account_id);
@@ -1395,15 +1427,12 @@ async fn attempt_queue(
                             );
                         }
                     }
-                    if let (Some(_ttl), true, Some(account_id)) = (
-                        route_settings.sticky.ttl_ms(),
-                        !conv_key.is_empty(),
-                        target.account_id.as_deref(),
-                    ) {
-                        service.route.sticky_bind(
-                            &conv_key, &model, account_id, sticky_source,
-                            logging::now_ms(), route_settings.sticky.ttl_ms().unwrap_or(0),
-                            sticky_generation,
+                    if let Some(account_id) = target.account_id.as_deref() {
+                        // 判据（空键 / TTL 档位 / 清除代次）在 `StickySessions::bind`
+                        // 里，这里不再重复一遍 —— 三处各写一份闸门正是此前自定义
+                        // 家成功分支整条漏掉绑定的成因（issue #2）。
+                        remember_session(
+                            service, &conv_key, &model, account_id, sticky_source, sticky_generation,
                         );
                     }
                     // Antigravity 的会话键随信封带出（签名缓存兜底档的写入键，

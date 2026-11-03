@@ -125,6 +125,33 @@ fn single(name: &str) -> Vec<String> {
     vec![name.to_string()]
 }
 
+/// 一份临时库 + 指定 provider 下的若干账号（`uids` 按给定顺序落库）。
+///
+/// 与 [`temp_service`] 的差别只有两处：provider 可指定、账号可多于一条。
+/// 后者是选路用例必须的 —— 只有一条账号时「粘住」与「没粘住」的结论相同，
+/// 断言不出任何东西。
+fn temp_service_for(provider: &str, uids: &[&str]) -> (TempDbDir, UpstreamService) {
+    use crate::server::core::account_store::AccountStore;
+    use crate::server::core::auth::AuthService;
+    use crate::server::db::Db;
+
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("pl-sticky-{}-{seq}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = AccountStore::with_db(Some(Db::open(&dir.join("agent2api.db")).expect("临时库应当能建起来")));
+    for uid in uids {
+        store
+            .add_account(
+                &json!({"auth": {"accessToken": "at"}, "account": {"uid": uid}}),
+                None,
+                Some(provider),
+            )
+            .expect("临时账号应当能建起来");
+    }
+    let service = UpstreamService::new(store.clone(), AuthService::for_store(store));
+    (TempDbDir(dir), service)
+}
+
 #[test]
 fn stateful_quota_bookkeeping_keeps_the_adapter_reset_at() {
     let (_dir, service, id) = temp_service();
@@ -428,4 +455,67 @@ fn a_deterministic_404_skips_the_in_place_resend() {
         fallback_retry_advice(&bad_request, 3, 400).is_some(),
         "404 的豁免不许顺手把 400 也豁免了"
     );
+}
+
+// ── 会话粘性的写入 → 查找闭环（issue #2）──────────────────────────────
+//
+// 这一组用例钉的是「失败了也不会报错」的那半边：写入侧（成功后
+// `sticky_bind`）与查找侧（选路时 `snapshot_for_model`）必须用**同一把键**、
+// **同一个 TTL 口径**。任何一侧漏了 model、时间戳或账号 id 的换算，症状都只是
+// `route.stickyHit` 恒为 false（请求照样成功、账号照样轮换），不会抛错。
+
+/// 同一会话键的第二条请求必须命中第一条绑定的账号。
+///
+/// 账号挂在 `custom-` 前缀的提供商下：那类账号不受「插件是否已安装」的可见性
+/// 闸门约束（见 `account_store::account_visible`），于是这条用例在任何测试环境
+/// 里都能走到真实的 `select_target_account` 选路，而不是被候选池为空提前短路。
+#[tokio::test]
+async fn a_second_request_on_the_same_session_sticks_to_the_first_account() {
+    use crate::server::core::routing::CooldownKeys;
+    use crate::server::core::upstream::rotate::select_target_account;
+    use crate::server::core::upstream::route_state::RouteState;
+    use axum::http::HeaderMap;
+
+    let provider = "custom-sticky-test";
+    let (_dir, service) = temp_service_for(provider, &["sticky-1", "sticky-2"]);
+    let body = json!({
+        "model": "sticky-model",
+        "messages": [{ "role": "user", "content": "hello" }],
+    });
+    let key = RouteState::conversation_key(&HeaderMap::new(), &body);
+    assert!(!key.is_empty(), "带 messages 的请求必须有会话键，否则粘性永远不生效");
+    let keys = CooldownKeys::new("sticky-model");
+
+    // 第一条：没有绑定，正常选路（转发成功后由 attempt_queue 调 sticky_bind）
+    let first = select_target_account(&service, &[provider], &keys, &[], None, &key)
+        .await
+        .expect("第一条请求应当选到账号");
+    assert_eq!(
+        first.decision.as_ref().map(|decision| decision["stickyHit"].clone()),
+        Some(json!(false)),
+        "首次请求不该命中粘性"
+    );
+    let bound = first.account_id.clone().expect("应当选到有 id 的账号");
+
+    // 与转发成功出口逐字同源的写入
+    let ttl = config::routing_settings().sticky.ttl_ms().unwrap_or(0);
+    assert!(ttl > 0, "测试环境的粘性档位必须开着（默认 auto）");
+    service.route.sticky_bind(
+        &key,
+        "sticky-model",
+        &bound,
+        "content-hash",
+        logging::now_ms(),
+        ttl,
+        service.route.sticky_generation(),
+    );
+
+    // 第二条：同一会话、同一模型 → 命中，并且仍然用同一个账号
+    let second = select_target_account(&service, &[provider], &keys, &[], None, &key)
+        .await
+        .expect("第二条请求应当选到账号");
+    let decision = second.decision.clone().expect("选路要带决策快照");
+    assert_eq!(decision["stickyHit"], json!(true), "同一会话的第二条请求应当命中粘性");
+    assert_eq!(decision["picked"], json!(bound), "命中后应当置顶原账号");
+    assert_eq!(second.account_id.as_deref(), Some(bound.as_str()));
 }
