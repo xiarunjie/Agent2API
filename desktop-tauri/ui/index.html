@@ -105,6 +105,12 @@
        只处理 768px 以下真机小屏：侧边栏抽屉化 + 表格卡片化 + 卡片堆叠 -->
   <link rel="stylesheet" href="css/mobile.css">
   <link rel="stylesheet" href="islands/ui.css">
+    <!-- 移动端抽屉开关（≤767px 生效，见 css/mobile.css）。
+         必须是 .sidebar 的前序兄弟：#nav-toggle:checked ~ .sidebar 靠这个相邻
+         关系开合，挪到 sidebar 后面就失效。桌面端靠 .nav-toggle-input 的
+         position:absolute 脱离文档流 —— .shell 是「2 列 + 100vh」的 grid，
+         在流内的多余子元素会多出一个隐式行、把富余高度分走一半。 -->
+    <input type="checkbox" id="nav-toggle" class="nav-toggle-input" aria-label="打开导航菜单">
   <!-- 多语言运行时：查表 t() + 静态文案扫描器（data-i18n 系列）。
        词典已由上面 head 里的引导脚本同步注入（document.write），这里只放运行时逻辑。
        必须排在 units.js / app.js 等业务脚本之前 —— 它们在加载期就可能读 window.wbI18n；
@@ -135,5 +141,11 @@
   <script src="custom-provider-ui.js"></script>
   <script src="markdown.js"></script>
   <script src="upgrade-panel.js"></script>
+  <!-- 移动端卡片化的列名注入（配合 css/mobile.css）：把 th[data-col] / 表头文字
+       写进对应 td 的 data-col，供 td::before { content: attr(data-col) } 渲染。
+       只在 ≤767px 执行，桌面端不碰 DOM；监听所有 .page 子树（60ms 合并），
+       React 岛重渲染后自动补写。
+       排在最后：要等 islands/ui.js 把各页面挂好、且表头已在 DOM 里。 -->
+  <script src="mobile-columns.js"></script>
 </body>
 </html>
