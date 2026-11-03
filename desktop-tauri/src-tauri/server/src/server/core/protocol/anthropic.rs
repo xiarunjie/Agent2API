@@ -696,6 +696,11 @@ pub fn usage_to_anthropic(usage: Option<&Value>) -> Value {
     })
 }
 
+/// usage 对象里的一个计数字段（缺失 / 非数值按 0）。
+fn usage_number(usage: &Value, key: &str) -> i64 {
+    usage.get(key).and_then(Value::as_i64).unwrap_or(0)
+}
+
 // ─── 流式：Chat SSE → Anthropic SSE ─────────────────────────
 
 /// Chat 的 SSE 字节流 → Anthropic 的 SSE 字节流（状态机）。
@@ -726,10 +731,20 @@ pub struct AnthropicStream {
     has_tool: bool,
     stop_reason: Option<String>,
     usage: Option<Value>,
+    /// 请求体估算的输入 token（口径见 `super::estimate`）。
+    ///
+    /// `message_start` 必须带 `input_tokens`，而上游的真实 usage 通常只出现在
+    /// 最后一帧 —— 首帧用它兜底；上游整轮没报输入时，收尾的 `message_delta`
+    /// 也沿用它（否则客户端会把锚点合并回 0，见 `reported_usage`）。
+    input_tokens_hint: i64,
 }
 
 impl AnthropicStream {
-    pub fn new(model: &str) -> Self {
+    /// `input_tokens_hint`：本次请求的输入 token 估算（`super::estimate`）。
+    ///
+    /// 上游的真实 usage 只出现在最后一帧，首帧拿不到 —— 传 0 就退回改造前
+    /// 「`message_start` 恒 0」的行为（issue #1）。生产路径必须传估算值。
+    pub fn new(model: &str, input_tokens_hint: i64) -> Self {
         Self {
             buffer: SseLineBuffer::new(),
             message_id: random_id("msg"),
@@ -747,6 +762,7 @@ impl AnthropicStream {
             has_tool: false,
             stop_reason: None,
             usage: None,
+            input_tokens_hint: input_tokens_hint.max(0),
         }
     }
 
@@ -792,7 +808,7 @@ impl AnthropicStream {
             json!({
                 "delta": { "stop_reason": stop_reason, "stop_sequence": Value::Null },
                 // Chat 的 usage 可能末尾才到；message_delta 允许补发累计输入与缓存用量。
-                "usage": usage_to_anthropic(self.usage.as_ref()),
+                "usage": self.reported_usage(),
             }),
         ));
         out.push(self.event("message_stop", json!({})));
@@ -995,12 +1011,58 @@ impl AnthropicStream {
         out
     }
 
+    /// 本次请求对外的 usage（首帧与收尾帧共用）。
+    ///
+    /// 上游给了输入就照抄（`usage_to_anthropic` 的口径：`input_tokens` 不含
+    /// 缓存命中）；上游**整轮都没报输入**时回落到 `input_tokens_hint`。
+    ///
+    /// 为什么收尾帧也要这一层：客户端（Claude Agent SDK / Claude Code）会把
+    /// `message_delta` 的 usage **按字段**合并进最终消息，收尾再发一次 0 等于
+    /// 把 `message_start` 的锚点覆盖回去 —— 那正是 issue #1 的另一半。
+    ///
+    /// 判据是「输入与缓存命中都为 0」而不是只看 `input_tokens`：全部命中缓存
+    /// 的请求（prompt = cached）本来就该是 `input_tokens: 0` +
+    /// `cache_read_input_tokens: N`，那是真实读数，不能被估算值顶掉。
+    fn reported_usage(&self) -> Value {
+        let mut usage = match self.usage.as_ref() {
+            Some(usage) => usage_to_anthropic(Some(usage)),
+            // 上游还没报 usage：键要补齐。Anthropic 的客户端按字段读缓存计数，
+            // 缺键与 0 在部分客户端（Hermes，上游 issue #424）里表现不同。
+            None => json!({
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_input_tokens": 0,
+            }),
+        };
+        let cache_read = usage
+            .get("cache_read_input_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        if usage_number(&usage, "input_tokens") <= 0 && cache_read <= 0 && self.input_tokens_hint > 0 {
+            usage["input_tokens"] = json!(self.input_tokens_hint);
+        }
+        usage
+    }
+
+    /// 首帧 `message_start`。
+    ///
+    /// ── usage 为什么不是上游的原样值 ────────────────────────────
+    /// 上游的真实 usage 只出现在最后一帧（Chat 系在收尾的 usage 帧，Anthropic
+    /// 系在 `message_delta` —— 它自己的 `message_start` 也只给 0 占位，见
+    /// `anthropic_outbound::ChatFromAnthropicStream::absorb_usage`），首帧时
+    /// `self.usage` 往往还是 None。改造前这里直接发 0，于是 Claude Code 这类
+    /// 客户端拿不到输入量、退回本地估算把每轮输入累加，`/context` 显示成
+    /// 2.6M / 1M（issue #1）。现在：
+    ///   · 首帧已带 usage（少数上游会在开头补一帧）→ 用上游的真值；
+    ///   · 没有 → 用请求体的估算值（`input_tokens_hint`），量级正确即可；
+    /// 真实值仍由收尾的 `message_delta` 给出，客户端在流结束时校正。
     fn emit_start(&mut self) -> Vec<bytes::Bytes> {
         if self.started {
             return Vec::new();
         }
         self.started = true;
-        let mut usage = usage_to_anthropic(self.usage.as_ref());
+        let mut usage = self.reported_usage();
+        // 首帧时还没有任何输出：output_tokens 恒 0（Anthropic 的语义）
         usage["output_tokens"] = json!(0);
         vec![self.event(
             "message_start",
