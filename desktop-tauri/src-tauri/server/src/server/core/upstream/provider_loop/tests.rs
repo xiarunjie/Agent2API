@@ -332,7 +332,7 @@ async fn a_real_413_response_is_sent_once_and_handed_back() {
         &transport,
         &mut budget,
         Some(&capture),
-        &RequestTelemetry::new(),
+        &std::sync::Arc::new(crate::server::core::upstream::usage::RequestTelemetry::new()),
         false,
         None,
         None,
