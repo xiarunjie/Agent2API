@@ -1205,13 +1205,8 @@ mod tests {
     /// 取回那条明细（本次用例的库里只有一条）
     fn only_row(stats: &RequestStats) -> serde_json::Value {
         let query = RequestQuery {
-            offset: 0,
             limit: Some(5),
-            model: None,
-            provider: None,
-            status: None,
-            start: None,
-            end: None,
+            ..Default::default()
         };
         let page = stats.query_requests(&query);
         let entries = page.get("entries").and_then(Value::as_array);
