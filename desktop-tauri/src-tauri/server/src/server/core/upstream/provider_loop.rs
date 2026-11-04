@@ -81,11 +81,10 @@ use crate::server::config;
 use crate::server::core::custom_providers;
 use crate::server::core::protocol::strip_internal_fields;
 use crate::server::core::providers::adapter::{
-    adapter_by_id, ProviderAdapter, RetryAdvice, RetryDecision, UpstreamErrorClass,
+    ProviderAdapter, RetryAdvice, RetryDecision, UpstreamErrorClass,
 };
 use crate::server::core::providers::custom::forward as custom_forward;
 use crate::server::core::providers::readiness;
-use crate::server::core::providers::router::route_for_forward;
 use crate::server::core::providers::{kind_from_id, meta};
 #[cfg(test)]
 use crate::server::core::providers::adapter::adapter_for;
@@ -98,9 +97,8 @@ use crate::server::errors::{parse_quota_reset_at, GatewayError};
 use crate::server::logging;
 
 use super::payload::{send_body, ProviderContext, SendBody};
-use super::request::{read_upstream_error, send_chat_request, TransportRequest};
+use super::request::{read_upstream_error, TransportRequest};
 use super::usage::LogPhase;
-use super::usage::RequestTelemetry;
 use super::{
     account_display, account_label, cancellation, connections::ConnectionGuard, describe_proxy,
     format_reset_text, refusal, reset_hint, rotate, ForwardOutcome, InFlightGuard, RouteTarget,
@@ -123,6 +121,7 @@ struct OutboundFailure {
     error: GatewayError,
     /// 插件明确终止本次请求；不再刷新凭证、降级提示词或换账号。
     stop: bool,
+    policy: crate::server::core::providers::policy::ErrorPolicy,
 }
 
 /// **原地重发**的退避预算（见 `send_with_retry` 的说明）。
@@ -194,7 +193,6 @@ fn take_switch(switches_left: &mut usize, total: usize) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn defer_to_next_account(
     service: &UpstreamService,
-    telemetry: &RequestTelemetry,
     provider_ids: &[&str],
     cooldown_keys: &rotate::CooldownKeys<'_>,
     tried_ids: &mut Vec<String>,
@@ -207,7 +205,7 @@ fn defer_to_next_account(
     switches_left: &mut usize,
     switch_total: usize,
     pinned: Option<&str>,
-    cross_provider_only: bool,
+    request_routing: &super::route_context::RequestRouting,
 ) -> bool {
     if let Some(account_id) = target.account_id.clone() {
         if !tried_ids.contains(&account_id) {
@@ -215,34 +213,11 @@ fn defer_to_next_account(
         }
     }
     let Some(next) =
-        rotate::pick_next_account(service, provider_ids, cooldown_keys, tried_ids, pinned)
+        rotate::pick_next_account(service, provider_ids, cooldown_keys, tried_ids, pinned, request_routing)
     else {
-        note_deferral_notice(
-            telemetry,
-            if tried_ids
-                .last()
-                .is_some_and(|last| !rotate::allows_route_skip(service, last))
-            {
-                "未换号（该账号已关闭失败换号）"
-            } else {
-                "未换号（无可用候选账号）"
-            },
-        );
         return false;
     };
-    // ── 体积拒绝只允许跨家顺延（issue #6）────────────────────────
-    // 字节墙是**每家自己的**（CatPaw 1 MiB、CodeArts 约 6 MiB、Loomy 的 APIG
-    // 约 12 MB）：同一份体在同一家的另一个账号上必然再撞一次，但换一家可能
-    // 直接过。所以这条判据收在这里 —— 挑出候选之后才判，判据只有一份。
-    if cross_provider_only && !payload_bound_blocks_switch(rotate::provider_of(&next), provider_id) {
-        note_deferral_notice(
-            telemetry,
-            "未换号（请求体超过这一家的入口上限，同家换号无效）",
-        );
-        return false;
-    }
     if !take_switch(switches_left, switch_total) {
-        note_deferral_notice(telemetry, "未换号（换号预算已耗尽）");
         return false;
     }
     let next_home = {
@@ -276,14 +251,6 @@ fn defer_to_next_account(
     true
 }
 
-/// 顺延判定收尾但**没有换号**时，把「为什么停在这里」写进本轮尝试明细的 `notice`。
-///
-/// 三档原因共用同一出口（原样返回本次错误），但排障时用户要能分清「明确禁止换号 /
-/// 队列里没有候选 / 换号预算耗尽」；尝试明细的 `notice` 不参与转发判定，只补可观测性。
-fn note_deferral_notice(telemetry: &RequestTelemetry, tag: &str) {
-    telemetry.note_attempt_notice(tag);
-}
-
 /// 瞬时 HTTP 状态码：适配器没声明专属重试时，按全局重试设置原样重发再看一眼。
 ///
 /// 只收 408（请求超时）与 5xx（网关 / 服务器错误）—— 都是上游或链路自己的
@@ -313,41 +280,6 @@ const PAYLOAD_SIZE_REJECTION_STATUSES: &[u16] = &[413];
 /// 与 [`PAYLOAD_SIZE_REJECTION_STATUSES`] 分成两个常量而不是合一：
 /// 一个是「字节」，一个是「名字」，出处与措辞不同，将来各自的排除面也可能变。
 const DETERMINISTIC_NOT_FOUND_STATUSES: &[u16] = &[404];
-
-/// 这一类的失败**在同一家换账号也没有意义**：结论由「这份请求体」决定，与是
-/// 哪个账号无关。
-///
-/// ── 为什么 413 在这里（而 404 不在）──────────────────────────
-/// 404 是「这个账号 / 这一家的套餐里没有这个模型」—— 换一个账号确实可能命中
-/// （见 [`DETERMINISTIC_NOT_FOUND_STATUSES`] 的说明），所以它照旧换号。
-/// 413 是「这份字节超过了入口的上限」：同一家的墙按字节量，同一份 body 换哪个
-/// 账号都一样大。issue #6 的形状正是如此 —— CatPaw 的 openresty 卡在 1 MiB，
-/// 会话式路径拿到的又是默认 Fatal，于是它会**把这一家的每个候选账号都撞一遍
-/// 同样的 413**，客户端白等 N 个往返，最后拿到的还是「HTTP 413: <html>…」。
-///
-/// ── 但**换一家**必须留着（这条改动第一版写错过）────────────────
-/// 字节墙是**每家自己的**：CatPaw 1 MiB、CodeArts 约 6 MiB、Loomy 的 APIG
-/// 约 12 MB。同一份 900 KB 的会话在 CatPaw 上 413、在别家可能 200 —— 这正是
-/// `aaa9d11` 那次修复里实测到的事实（同一份会话在 codearts 上是 200）。
-/// 所以判据按**家**收窄：同一家不再换号，换到另一家照常放行。
-const PAYLOAD_BOUND_STATUSES: &[u16] = &[413];
-
-/// 这次失败是否属于「**同一家**换号也白换」的确定性体积拒绝。
-fn payload_bound_failure(class: &UpstreamErrorClass) -> bool {
-    matches!(
-        class,
-        UpstreamErrorClass::Fatal { status, .. } if PAYLOAD_BOUND_STATUSES.contains(status)
-    )
-}
-
-/// 换到 `next` 还有没有意义：体积拒绝只在**同家**无意义，跨家仍可能成功。
-///
-/// 与 [`payload_bound_failure`] 分开是因为判据不同：前者问「这份失败是什么」，
-/// 这里问「换成这个账号还有没有救」。两条都在，别只留一条 —— 只留前者会掐掉
-/// 跨家回退（第一版就是这么错的），只留后者则同家白撞照旧。
-fn payload_bound_blocks_switch(next_provider: &str, current_provider: &str) -> bool {
-    next_provider == current_provider
-}
 
 /// 轮询出网档（`core::proxy_rotate`）在 429 时**原地换出口**的次数上限。
 ///
@@ -400,42 +332,6 @@ fn transport_retry_advice(error: &super::request::UpstreamRequestError, remainin
         delay_ms: config::retry_settings().delay_ms(),
         reason: error.reason.clone(),
     })
-}
-
-/// 上游 `Retry-After` 头 → 绝对恢复时刻（毫秒）；两种合法形态都认：
-/// delay-seconds（整数秒）与 HTTP-date（RFC 2822）。无法识别返回 None（调用方落默认冷却）。
-fn retry_after_reset_at(retry_after: Option<&str>, now_ms: i64) -> Option<i64> {
-    let text = retry_after?.trim();
-    if let Ok(seconds) = text.parse::<i64>() {
-        return (seconds > 0)
-            .then(|| now_ms.saturating_add(seconds.saturating_mul(1000)));
-    }
-    chrono::DateTime::parse_from_rfc2822(text)
-        .ok()
-        .map(|date| date.timestamp_millis())
-        .filter(|reset_at| *reset_at > now_ms)
-}
-
-/// 空响应体的 429 兜底：HTTP 状态码足以证明是限流，但插件分类器拿不到文案证据
-/// 时可能把它降级成 Fatal —— 那样既不冷却也不换号。这里只把「429 + 空文案 +
-/// 无证据分类」按短期限流归类，其余形态一律原样保留。
-fn empty_body_429_class(
-    class: UpstreamErrorClass,
-    status: u16,
-    body_message: &str,
-    upstream_code: Option<i64>,
-    retry_after: Option<&str>,
-    now_ms: i64,
-) -> UpstreamErrorClass {
-    if status == 429 && body_message.is_empty() && matches!(class, UpstreamErrorClass::Fatal { .. }) {
-        return UpstreamErrorClass::QuotaLimited {
-            reset_at: retry_after_reset_at(retry_after, now_ms),
-            message: "上游返回 429: 请求频率受限，请稍后重试".to_string(),
-            upstream_code,
-            status,
-        };
-    }
-    class
 }
 
 /// 兜底退避建议：**非限额**的上游错误，在换账号之前先在同一账号上重发。
@@ -531,11 +427,13 @@ pub(super) async fn forward_with_providers(
             .map(crate::server::core::key_scope::KeyScope::allowed_provider_ids)
             .unwrap_or_default()
     } else if let Some(operation) = ctx.images {
-        crate::server::core::routing_scope::providers_for(
-            &model, &crate::server::core::providers::images::operation_providers(&model, operation),
-        )
+        ctx.routing.providers(crate::server::core::providers::images::operation_providers(&model, operation))
     } else {
-        route_for_forward(&model)
+        let available = crate::server::core::providers::catalog::forwarding_providers(&model);
+        let available = if available.is_empty() && crate::server::core::providers::catalog::providers_for_model(&model).is_empty() {
+            vec![crate::server::core::providers::DEFAULT_PROVIDER_ID.to_string()]
+        } else { available };
+        ctx.routing.providers(available)
     };
     let candidates: Vec<_> = if ctx.images.is_some() {
         candidates
@@ -566,10 +464,17 @@ pub(super) async fn forward_with_providers(
             )
             .with_code("model_not_found"));
         }
-        if config::routing_profiles().effective(&model).is_some() {
+        if let Some(profile) = &ctx.routing.profile {
+            let hint = if !ctx.routing.scope.is_empty() {
+                "请在路由页该模型的独立配置中添加或启用提供商"
+            } else if profile.scope() == config::RoutingProviderScope::Selected {
+                "请在路由页「全局配置 → 参与范围」中改为自动参与，或将提供商加入指定名单"
+            } else {
+                "请在路由页「全局配置」中恢复已停用的提供商"
+            };
             return Err(GatewayError::with_status(
                 503,
-                format!("模型 {model} 的路由中没有启用的提供商，请在路由页调整参与范围"),
+                format!("模型 {model} 没有可参与转发的提供商：当前路由的参与范围将候选全部排除。{hint}"),
             ));
         }
         return Err(GatewayError::new("没有可用的提供商，无法转发"));
@@ -585,7 +490,7 @@ pub(super) async fn forward_with_providers(
     let provider_ids: Vec<&str> = candidates.iter().map(String::as_str).collect();
     // 映射扩池的提示：链比本名承载家长，说明追加了映射的提供商（选路顺序仍是
     // 原生优先）。用户看到请求落到映射家时，这里与发送侧的改写日志对得上。
-    let with_mapping = crate::server::core::model_rules::current()
+    let with_mapping = crate::server::core::model_rules::shared()
         .mappings_of(&model)
         .len() > 0;
     logging::verbose(
@@ -683,6 +588,16 @@ async fn attempt_queue(
     let conv_key = super::route_state::RouteState::conversation_key(ctx.client_headers, &ctx.body);
     let sticky_generation = service.route.sticky_generation();
     let sticky_source = super::route_state::RouteState::conversation_source(ctx.client_headers, &ctx.body);
+    if !conv_key.is_empty() {
+        let mut decision = json!({
+            "sessionId": super::route_sticky::entry_id(&conv_key, &model), "sessionSource": sticky_source,
+            "strategy": ctx.routing.settings.strategy.as_str(), "sticky": ctx.routing.settings.sticky.as_str(),
+            "scope": ctx.routing.scope, "configSnapshot": ctx.routing.json(),
+        });
+        if ctx.routing.settings.sticky.ttl_ms().is_some() { decision["stickyId"] = decision["sessionId"].clone(); }
+        ctx.telemetry.set_route_decision(decision);
+    }
+    let mut conversation_ids = None;
     let mut tried_ids: Vec<String> = Vec::new();
     // ── 两份独立的预算（见 config::RetrySettings）─────────────────────
     //   - `budget`：同一个账号上还能**原地重发**几次。整份请求共用一份，
@@ -747,6 +662,7 @@ async fn attempt_queue(
             &tried_ids,
             ctx.pinned_account,
             &conv_key,
+            &ctx.routing,
         )
         .await?;
         if let Some(override_proxy) = ctx.proxy_override {
@@ -762,7 +678,8 @@ async fn attempt_queue(
         // 决策快照挂进 telemetry（最后一次为准：请求日志的「路由回放」显示
         // 的是最终承载那次选路的完整排序 —— 与 attempts 明细的换号链互补，
         // 那边回答「试了谁」，这边回答「当时为什么这么排」）。
-        if let Some(decision) = target.decision.clone() {
+        if let Some(mut decision) = target.decision.clone() {
+            decision["sessionSource"] = Value::String(sticky_source.to_string());
             ctx.telemetry.set_route_decision(decision);
         }
         // 连接计数改绑到这一轮选中的账号：失败重试换账号时计数跟着走，
@@ -783,7 +700,7 @@ async fn attempt_queue(
                     if let Some(account_id) = custom_account_id.as_deref() {
                         service.route.sticky_bind(
                             &conv_key, &model, account_id, sticky_source, logging::now_ms(),
-                            config::routing_settings().sticky.ttl_ms().unwrap_or(0), sticky_generation,
+                            ctx.routing.settings.sticky.ttl_ms().unwrap_or(0), sticky_generation,
                         );
                         service.route.backoff_clear(account_id);
                         service.route.sink_clear(account_id);
@@ -831,12 +748,12 @@ async fn attempt_queue(
                                 );
                                 // 与内置家的动作 1 同款：还有额度时被 429 的
                                 // 垫底（见那边的说明）
-                                if config::routing_settings().sink && ctx.pinned_account.is_none() {
+                                if ctx.routing.settings.sink && ctx.pinned_account.is_none() {
                                     service.route.sink_mark(&account_id, logging::now_ms());
                                 }
                             } else {
                                 // 与内置家的动作 3 同款：失败退避 + 熔断计数
-                                let route_settings = config::routing_settings();
+                                let route_settings = ctx.routing.settings;
                                 if route_settings.failover_backoff {
                                     service.route.backoff_mark(&account_id, logging::now_ms());
                                 }
@@ -857,13 +774,13 @@ async fn attempt_queue(
                         &cooldown_keys,
                         &tried_ids,
                         ctx.pinned_account,
+                        &ctx.routing,
                     ) {
                         Some(next) => {
                             // 换号额度用尽 → 队列里即使还有人也不再顺延
                             // （`take_switch` 已写过那行终端日志），本次错误原样
                             // 返回：与「没有下一个可用账号」同一个出口。
                             if !take_switch(&mut switches_left, switch_total) {
-                                note_deferral_notice(ctx.telemetry, "未换号（换号预算已耗尽）");
                                 return Err(error);
                             }
                             logging::console_line(
@@ -878,27 +795,20 @@ async fn attempt_queue(
                             );
                             continue 'accounts;
                         }
-                        None => {
-                            note_deferral_notice(
-                                ctx.telemetry,
-                                if tried_ids
-                                    .last()
-                                    .is_some_and(|last| !rotate::allows_route_skip(service, last))
-                                {
-                                    "未换号（该账号已关闭失败换号）"
-                                } else {
-                                    "未换号（无可用候选账号）"
-                                },
-                            );
-                            return Err(error);
-                        }
+                        None => return Err(error),
                     }
                 }
             }
         }
-        // ── 适配器分派：插件 → 本体订阅适配器 → 旧 Kind 占位 ──────────
-        // 统一入口保留插件优先与旧占位兜底；Arc 持有本轮实现，不在 await 后重新查表。
-        let adapter_handle = adapter_by_id(&target.provider).ok_or_else(|| {
+        // 查表与租约登记原子完成；切换期间等待新执行体，不消耗上游重试预算。
+        let ready = crate::server::core::providers::adapter::adapter_by_id_ready(&target.provider);
+        let adapter_handle = if let Some(token) = ctx.telemetry.cancel_token() {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => return Err(cancellation::cancelled_error()),
+                result = ready => result?,
+            }
+        } else { ready.await? }.ok_or_else(|| {
             GatewayError::with_status(
                 503,
                 format!("账号所属提供商「{}」未知，无法转发", target.provider),
@@ -909,7 +819,12 @@ async fn attempt_queue(
         // 没有「按家重置预算」这一步了：两份预算都在循环外开好、整份请求共用
         // （理由见上面的注释）。`provider_id` 仍然要取 —— 下面的发送体缓存、
         // 日志与遥测记账都用它。
-        if adapter.is_stateful() {
+        // 会话式通道只服务「一次对话请求就是一个会话轮次」的家；生图请求走
+        // 图片通道（`build_image_request_async`），不能被会话式分支截走。
+        // 豆包工作两者都声明（会话式对话 + 对话流里的生图任务），漏了这半个
+        // 判据时生图体会被当成对话体发进 `conversation`，插件按对话协议解析
+        // 立刻报「messages 必须包含消息」——症状与账号无关，换个账号也一样。
+        if adapter.is_stateful() && ctx.images.is_none() {
             // 会话式转发（CatPaw）内部没有轮换，但**队列的兜底仍然生效**：
             // 它失败了就把它记入已尝试、回到循环挑下一个账号 —— 可能已经换了一家。
             // 没有下一个可用账号时，把这个错误原样透传（它的文案最贴近真实原因）。
@@ -931,12 +846,12 @@ async fn attempt_queue(
                     if let Some(account_id) = stateful_account_id.as_deref() {
                         service.route.sticky_bind(
                             &conv_key, &model, account_id, sticky_source, logging::now_ms(),
-                            config::routing_settings().sticky.ttl_ms().unwrap_or(0), sticky_generation,
+                            ctx.routing.settings.sticky.ttl_ms().unwrap_or(0), sticky_generation,
                         );
                         service.route.backoff_clear(account_id);
                         service.route.sink_clear(account_id);
                     }
-                    return Ok(outcome);
+                    return Ok(crate::server::core::plugin_host::hold_adapter(outcome, adapter_handle));
                 },
                 Err(error) => {
                     // 手动终止优先（与无状态 / 自定义两条路径同一判定与理由）：
@@ -965,12 +880,6 @@ async fn attempt_queue(
                     // 拆散取值 —— 拆散后「漏带一个字段」编译期与运行期都不报错
                     // （本分支此前就把 `reset_at` 写成死 `None`，见那个函数的说明）。
                     let class = adapter.classify_conversation_error(&error);
-                    // ── 体积拒绝：同家不换号，跨家仍放行（issue #6）──────
-                    // 会话式路径没有「原地重发」这一步，它的兜底就是顺延；
-                    // 同一家的字节墙与账号无关（换过去只会把同一份体再撞一次），
-                    // 但**别家**的墙不一样宽 —— 所以先挑下一个候选，只在它还是
-                    // 同一家时才收手（见 `payload_bound_blocks_switch`）。
-                    let payload_bound = payload_bound_failure(&class);
                     // Scoped runtime 的原生 loader 已拥有单次 token 恢复；宿主不再消费
                     // refresh，也不把 Fatal/权限/WAF/取消/超时改成账号顺延。
                     if strict_runtime && !matches!(&class, UpstreamErrorClass::QuotaLimited { .. }) {
@@ -1003,25 +912,13 @@ async fn attempt_queue(
                         &cooldown_keys,
                         &tried_ids,
                         ctx.pinned_account,
+                        &ctx.routing,
                     ) {
                         Some(next) => {
-                            if payload_bound
-                                && payload_bound_blocks_switch(
-                                    rotate::provider_of(&next),
-                                    provider_id,
-                                )
-                            {
-                                note_deferral_notice(
-                                    ctx.telemetry,
-                                    "未换号（请求体超过这一家的入口上限，同家换号无效）",
-                                );
-                                return Err(error);
-                            }
                             // 换号额度用尽 → 队列里即使还有人也不再顺延
                             // （`take_switch` 已写过那行终端日志），本次错误原样
                             // 返回：与「没有下一个可用账号」同一个出口。
                             if !take_switch(&mut switches_left, switch_total) {
-                                note_deferral_notice(ctx.telemetry, "未换号（换号预算已耗尽）");
                                 return Err(error);
                             }
                             // 顺延这件事本身由请求日志的尝试链回答（本轮明细已经
@@ -1038,20 +935,7 @@ async fn attempt_queue(
                             );
                             continue 'accounts;
                         }
-                        None => {
-                            note_deferral_notice(
-                                ctx.telemetry,
-                                if tried_ids
-                                    .last()
-                                    .is_some_and(|last| !rotate::allows_route_skip(service, last))
-                                {
-                                    "未换号（该账号已关闭失败换号）"
-                                } else {
-                                    "未换号（无可用候选账号）"
-                                },
-                            );
-                            return Err(error);
-                        }
+                        None => return Err(error),
                     }
                 }
             }
@@ -1186,6 +1070,7 @@ async fn attempt_queue(
         // 还要在下面套一层响应翻译，见 `UpstreamResponse` 的说明。第四个元素是
         // Antigravity 请求信封里的会话键（签名缓存兜底档的写入键，issue #291；
         // 其余家是空串 —— 提取见循环内唯一那条成功 break）
+        let mut native_tools;
         let (response, wire_model, response_protocol, antigravity_session) = loop {
             // 发送体在这一轮发送前取一次（同一家同池同降级状态下复用缓存项）：
             // 借用在本次迭代内有效，`continue`（401 刷新 / 内容拦截补救）时
@@ -1232,12 +1117,21 @@ async fn attempt_queue(
             // 在此也成立（那是本字段的全部前提，见模块头）。
             // 走异步伴生方法：内置家直接转调同步实现（零成本），插件家走 RPC。
             // 见 `ProviderAdapter::build_chat_request_async` 的说明。
+            if ctx.images.is_none() {
+                if let Some(override_proxy) = ctx.proxy_override {
+                    session["proxy"] = override_proxy.as_ref().map(|proxy| json!({
+                        "protocol": proxy.protocol, "host": proxy.host, "port": proxy.port,
+                        "username": proxy.username, "password": proxy.password,
+                    })).unwrap_or_else(|| json!({ "source": "direct" }));
+                    session["proxyError"] = Value::Null;
+                }
+            }
             let planned = if let Some(operation) = ctx.images {
                 adapter.build_image_request_async(&session, body, ctx.client_headers, operation).await
             } else {
                 adapter.build_chat_request_async(&session, body, ctx.client_headers).await
             };
-            let plan = match planned {
+            let mut plan = match planned {
                 Ok(plan) => plan,
                 Err(error) => {
                     ctx.telemetry.finish_last_attempt(
@@ -1258,12 +1152,14 @@ async fn attempt_queue(
                     // 500 内部坏了）继续**直接终止**：那些是「这份请求本身坏了」，
                     // 换个账号发的是同一份坏请求，换满预算只会把一次 400 变成四条
                     // 400，并把真实原因埋进顺延链里。
-                    if i32::from(readiness::LOCAL_PRECONDITION_STATUS) != error.status_code {
+                    let account_unavailable = error.code.as_deref().is_some_and(|code| {
+                        matches!(code, "account_model_unavailable" | "account_model_permissions_unknown")
+                    });
+                    if i32::from(readiness::LOCAL_PRECONDITION_STATUS) != error.status_code && !account_unavailable {
                         return Err(error);
                     }
                     if defer_to_next_account(
                         service,
-                        ctx.telemetry,
                         provider_ids,
                         &cooldown_keys,
                         &mut tried_ids,
@@ -1276,13 +1172,35 @@ async fn attempt_queue(
                         &mut switches_left,
                         switch_total,
                         ctx.pinned_account,
-                        false,
+                        &ctx.routing,
                     ) {
                         continue 'accounts;
                     }
                     return Err(error);
                 }
             };
+            if plan.policy.stable_conversation {
+                if conversation_ids.is_none() {
+                    conversation_ids = Some(match super::conversation_ids::resolve(ctx.client_headers, ctx.body) {
+                        Ok(ids) => ids,
+                        Err(error) => {
+                            ctx.telemetry.finish_last_attempt(Some(i64::from(error.status_code)), Some(&error.message));
+                            return Err(error);
+                        }
+                    });
+                }
+                if let Some(ids) = &conversation_ids { ids.apply(&mut plan.headers); }
+            }
+            native_tools = if plan.policy.repair_native_tools {
+                super::native_tools::declared_tools(&plan.body)
+            } else { Vec::new() };
+            if ctx.images.is_none() {
+                let reasoning = plan.reasoning.clone().unwrap_or_else(|| {
+                    super::payload::outbound_reasoning_of(provider_id, &plan.body)
+                        .or_else(|| send.wire_reasoning.clone())
+                });
+                ctx.telemetry.note_upstream_reasoning(reasoning);
+            }
             // 序列化失败只可能是内部数据坏了（适配器给出的 body 里含不可序列化的
             // 值），按 500 收敛。同样要先给明细定稿（理由同上一条）。
             let payload = match serde_json::to_string(&plan.body) {
@@ -1349,6 +1267,7 @@ async fn attempt_queue(
                     crate::server::core::providers::adapter::UpstreamResponse::Images(kind) => Some(kind),
                     _ => None,
                 },
+                plan.policy.network.as_ref(),
             )
             .await
             {
@@ -1368,7 +1287,7 @@ async fn attempt_queue(
                     // 「配置开着且有会话键」时绑 —— Turn / Off 档 ttl 为 None。
                     // 绑定无条件覆盖：会话换到新账号（前一个失败顺延过来）
                     // 时，粘的必须是现在这个能干活的。
-                    let route_settings = config::routing_settings();
+                    let route_settings = ctx.routing.settings;
                     if let Some(account_id) = target.account_id.as_deref() {
                         if route_settings.breaker_enabled {
                             service
@@ -1387,8 +1306,9 @@ async fn attempt_queue(
                         // 「需要重新登录」上，用户明明已经重新登录、账号也能用，
                         // 界面却一直红着。
                         // CodeArts 的临时访问凭据仍可能有效，转发成功不代表刷新授权恢复。
-                        if service.store.needs_relogin(account_id) && adapter.provider_id() != "codearts" {
-                            service.store.set_needs_relogin(account_id, None);
+                        if adapter.provider_id() != "codearts" && target.account.as_ref()
+                            .is_some_and(|account| account.get("needsRelogin").and_then(Value::as_bool) == Some(true)) {
+                            crate::server::core::blocking::in_place(|| service.store.set_needs_relogin(account_id, None));
                             logging::log(
                                 "[Upstream]",
                                 &format!("账号 {account_id} 转发成功，已清除「需要重新登录」标记"),
@@ -1436,7 +1356,18 @@ async fn attempt_queue(
                         );
                         return Err(cancellation::cancelled_error());
                     }
-                    if failure.stop {
+                    if let Some(account_id) = target.account_id.as_deref() {
+                        if failure.policy.suspend_account {
+                            let _ = crate::server::core::blocking::in_place(|| {
+                                service.store.suspend_upstream_account(account_id, &failure.policy.reason)
+                            });
+                        } else if let Some(until) = failure.policy.account_cooldown_until {
+                            let _ = crate::server::core::blocking::in_place(|| {
+                                service.store.cooldown_upstream_account(account_id, until, &failure.policy.reason)
+                            });
+                        }
+                    }
+                    if failure.stop || failure.policy.stop {
                         ctx.telemetry.finish_last_attempt(
                             Some(i64::from(failure.error.status_code)),
                             Some(&failure.error.message),
@@ -1451,15 +1382,9 @@ async fn attempt_queue(
                     // 「这一轮的结局已定」那条公共定稿出口，之后与其它错误
                     // 一样按动作 1 / 动作 3 换号顺延：直接换下一个账号继续试，
                     // 换满或没有更多账号时错误才原样返回客户端。
-                    let named_switch = direct_switch_status(i64::from(failure.error.status_code));
-                    // ── 体积拒绝：同家不换号，跨家仍放行（issue #6）──────
-                    // 与有状态路径同一条判据。原地重发那一档已经由
-                    // `fallback_retry_advice` 挡住，这里补的是「同家换号」那一档：
-                    // 别家的字节墙更宽，跨家回退必须留着（见
-                    // `payload_bound_blocks_switch` 的说明）。判定放在
-                    // `defer_to_next_account` 挑出候选之后 —— 只有真挑到
-                    // 「同一家的另一个账号」时才收手。
-                    let payload_bound = payload_bound_failure(&failure.class);
+                    let named_switch = failure.policy.suspend_account
+                        || failure.policy.account_cooldown_until.is_some()
+                        || direct_switch_status(i64::from(failure.error.status_code));
                     // ── 动作 0：内容策略拦截 → 换中性提示词，同账号立即重试一次 ──
                     // 上游按逐字精确匹配审核，命中即整单拦截；这是**误报**而不是
                     // 账号问题（余额健康、未限流、session 未死），所以既不罚账号
@@ -1595,11 +1520,11 @@ async fn attempt_queue(
                             // 只在该账号尚未被标记时写一次：401 会随每次请求重复
                             // 出现，每轮都写一遍等于把账号表当日志写。`set_needs_relogin`
                             // 本身是幂等的，这里的判据只是省掉重复的写盘。
-                            if !service.store.needs_relogin(&account_id) {
-                                service.store.set_needs_relogin(
+                            if !crate::server::core::blocking::in_place(|| service.store.needs_relogin(&account_id)) {
+                                crate::server::core::blocking::in_place(|| service.store.set_needs_relogin(
                                     &account_id,
                                     Some("上游拒绝了这个登录态（会话已失效）"),
-                                );
+                                ));
                                 logging::log(
                                     "[Upstream]",
                                     &format!(
@@ -1652,7 +1577,7 @@ async fn attempt_queue(
                             // 正常冷却，不算），排到所有没被 429 过的后面 —— 负载
                             // 摊开，而不是每次都回到队列头再撞一遍。成功一次或
                             // 重启后放出（见 route_state.rs）。
-                            if config::routing_settings().sink && ctx.pinned_account.is_none() {
+                            if ctx.routing.settings.sink && ctx.pinned_account.is_none() {
                                 service.route.sink_mark(&account_id, logging::now_ms());
                             }
                             // 日志文案与账号页的「限流」列同口径：以真名为主，
@@ -1661,10 +1586,6 @@ async fn attempt_queue(
                             let from_label =
                                 account_label(target.account.as_ref(), &account_id, &session);
                             if !rotate::allows_route_skip(service, &account_id) {
-                                note_deferral_notice(
-                                    ctx.telemetry,
-                                    "未换号（该账号已关闭失败换号）",
-                                );
                                 rotate::report_limit_event(
                                     "warn",
                                     &format!("账号「{from_label}」对模型 {limit_label} 已限额，已关闭失败换号"),
@@ -1679,6 +1600,7 @@ async fn attempt_queue(
                                 &cooldown_keys,
                                 &tried_ids,
                                 ctx.pinned_account,
+                                &ctx.routing,
                             ) {
                                 Some(next) => {
                                     let next_label = account_display(&next);
@@ -1732,10 +1654,6 @@ async fn attempt_queue(
                                     continue 'accounts;
                                 }
                                 None => {
-                                    note_deferral_notice(
-                                        ctx.telemetry,
-                                        "未换号（无可用候选账号）",
-                                    );
                                     // 所有候选都在冷却 / 禁用里 —— 把**最早的恢复时刻**
                                     // 带进文案：客户端（Claude Code / Codex 等会读这条
                                     // 文案的）才能做合法的退避等待，而不是立刻重试再撞
@@ -1807,7 +1725,7 @@ async fn attempt_queue(
                             // 翻倍，上限 1 小时）；熔断：连续失败到阈值打开。
                             // 429（额度尽）不走这里 —— 它有自己的冷却机制，
                             // 且「等重置」比「退避」精确。
-                            let route_settings = config::routing_settings();
+                            let route_settings = ctx.routing.settings;
                             if route_settings.failover_backoff {
                                 service.route.backoff_mark(&account_id, logging::now_ms());
                             }
@@ -1839,7 +1757,6 @@ async fn attempt_queue(
                     // 失败」共用同一条路，判据不该有两份。
                     if defer_to_next_account(
                         service,
-                        ctx.telemetry,
                         provider_ids,
                         &cooldown_keys,
                         &mut tried_ids,
@@ -1852,7 +1769,7 @@ async fn attempt_queue(
                         &mut switches_left,
                         switch_total,
                         ctx.pinned_account,
-                        payload_bound,
+                        &ctx.routing,
                     ) {
                         continue 'accounts;
                     }
@@ -1870,7 +1787,7 @@ async fn attempt_queue(
             &limit_model_label(&model, &wire_model),
             &session,
             provider_id,
-        );
+        ).await;
         logging::verbose(
             "[Upstream]",
             &format!(
@@ -2023,6 +1940,7 @@ async fn attempt_queue(
                         &cooldown_keys,
                         &tried_ids,
                         ctx.pinned_account,
+                        &ctx.routing,
                     ) {
                         Some(next) => {
                             if !take_switch(&mut switches_left, switch_total) {
@@ -2075,6 +1993,8 @@ async fn attempt_queue(
             Gate::Live(response)
         };
 
+        let mut response_policy = frame_policy_of(adapter, &model);
+        response_policy.native_tools = native_tools;
         // ── 上游响应协议（适配器在构造请求时一并给出）──────────────────
         // 绝大多数上游说 chat SSE（`ForwardStream` / 聚合器的默认输入）；
         // 三条例外各有一台翻译状态机（见 `upstream::translate` 的模块头）：
@@ -2150,21 +2070,21 @@ async fn attempt_queue(
                 }
             };
             if ctx.stream {
-                return Ok(ForwardOutcome::Stream {
+                return Ok(crate::server::core::plugin_host::hold_adapter(ForwardOutcome::Stream {
                     status,
                     stream: Box::new(super::ForwardStream::from_translated(
                         translated,
                         slot.take(),
                         connections.handoff(),
                         ctx.telemetry.clone(),
-                        frame_policy_of(adapter, &model),
+                        response_policy.clone(),
                     )),
-                });
+                }, adapter_handle));
             }
             let aggregated = super::aggregate::aggregate_frame_stream(
                 translated,
                 ctx.telemetry.clone(),
-                frame_policy_of(adapter, &model),
+                response_policy.clone(),
             )
             .await?;
             return Ok(ForwardOutcome::Completion {
@@ -2177,7 +2097,7 @@ async fn attempt_queue(
         match gate {
             Gate::Live(response) => {
                 if ctx.stream {
-                    return Ok(ForwardOutcome::Stream {
+                    return Ok(crate::server::core::plugin_host::hold_adapter(ForwardOutcome::Stream {
                         status: response.status().as_u16(),
                         // 槽位交给流：流跑完 / 客户端断开 / 流被 drop 时才放行等待者；
                         // 连接计数同样移交（`handoff` 转移所有权，本栈帧的凭证随即失效，
@@ -2187,14 +2107,14 @@ async fn attempt_queue(
                             slot.take(),
                             connections.handoff(),
                             ctx.telemetry.clone(),
-                            frame_policy_of(adapter, &model),
+                            response_policy.clone(),
                         )),
-                    });
+                    }, adapter_handle));
                 }
                 let aggregated = super::aggregate::aggregate_sse_completion(
                     response,
                     ctx.telemetry.clone(),
-                    frame_policy_of(adapter, &model),
+                    response_policy.clone(),
                 )
                 .await?;
                 log_aggregated(&aggregated);
@@ -2205,21 +2125,21 @@ async fn attempt_queue(
                 let capture = ctx.telemetry.capture();
                 let source = head.into_stream(capture);
                 if ctx.stream {
-                    return Ok(ForwardOutcome::Stream {
+                    return Ok(crate::server::core::plugin_host::hold_adapter(ForwardOutcome::Stream {
                         status,
                         stream: Box::new(super::ForwardStream::from_translated(
                             source,
                             slot.take(),
                             connections.handoff(),
                             ctx.telemetry.clone(),
-                            frame_policy_of(adapter, &model),
+                            response_policy.clone(),
                         )),
-                    });
+                    }, adapter_handle));
                 }
                 let aggregated = super::aggregate::aggregate_frame_stream(
                     source,
                     ctx.telemetry.clone(),
-                    frame_policy_of(adapter, &model),
+                    response_policy.clone(),
                 )
                 .await?;
                 log_aggregated(&aggregated);
@@ -2439,7 +2359,7 @@ async fn attempt_custom(
                     ),
                     &Value::Null,
                     &provider_id,
-                );
+                ).await;
                 logging::verbose(
                     "[Upstream]",
                     &format!("自定义转发完成: HTTP {status}（{}ms）", logging::now_ms() - started_at),
@@ -2452,7 +2372,10 @@ async fn attempt_custom(
                 // 与「动作 0 换提示词重试」同一记账形态，见 `note_attempt_retry`）。
                 if rotate_left > 0 && error.is_quota_limit() {
                     if let Some(account_id) = target.account_id.as_deref() {
-                        match service.store.next_rotate_proxy(account_id) {
+                        let store = service.store.clone();
+                        let account_id = account_id.to_string();
+                        let next = crate::server::core::blocking::run(move || store.next_rotate_proxy(&account_id)).await?;
+                        match next {
                             Ok(Some(next)) => {
                                 rotate_left -= 1;
                                 let reason = format!(
@@ -2639,7 +2562,7 @@ async fn attempt_stateful(
                 &limit_model_label(&model, wire_model),
                 &Value::Null,
                 provider_id,
-            );
+            ).await;
             logging::verbose(
                 "[Upstream]",
                 &format!("会话式转发完成（{}ms）", logging::now_ms() - started_at),
@@ -2749,7 +2672,7 @@ impl futures::Stream for SlotHoldingStream {
 ///
 /// 独立出来是因为成功路径在 401 刷新重试之后才到达，而那时 `target` 与
 /// `session` 都还在作用域里 —— 抽成函数让「成功到底清了什么」一眼可见。
-fn cap_cleared(
+async fn cap_cleared(
     service: &UpstreamService,
     target: &RouteTarget,
     model: &str,
@@ -2760,24 +2683,26 @@ fn cap_cleared(
     let Some(account_id) = target.account_id.as_deref() else {
         return;
     };
-    let had_limit = rotate::account_had_limit(service, account_id, model);
-    service.store.clear_rate_limit(account_id, model);
-    // 仅当之前确实处于限额状态才记一条，避免每次成功请求都刷日志
-    if had_limit {
-        let label = account_label(target.account.as_ref(), account_id, session);
-        rotate::report_limit_event(
-            "info",
-            &format!("账号「{label}」对模型 {model_label} 已恢复可用"),
-            None,
-            Some(&label),
-            model,
-            None,
-            0,
-            0,
-            None,
-            provider_id,
-        );
+    let store = service.store.clone();
+    let id = account_id.to_string();
+    let wire_model = model.to_string();
+    let cleared = crate::server::core::blocking::run(move || store.clear_rate_limit(&id, &wire_model)).await;
+    if !matches!(cleared, Ok(true)) {
+        return;
     }
+    let label = account_label(target.account.as_ref(), account_id, session);
+    rotate::report_limit_event(
+        "info",
+        &format!("账号「{label}」对模型 {model_label} 已恢复可用"),
+        None,
+        Some(&label),
+        model,
+        None,
+        0,
+        0,
+        None,
+        provider_id,
+    );
 }
 
 /// 上游请求体里的模型名（缺失/非字符串给空串，与改造前一致）
@@ -2841,6 +2766,7 @@ fn cancelled_failure() -> OutboundFailure {
         },
         error: cancellation::cancelled_error(),
         stop: true,
+        policy: Default::default(),
     }
 }
 
@@ -2850,18 +2776,19 @@ fn cancelled_failure() -> OutboundFailure {
 /// 错误文案直接用手动终止的原文 —— 它不会被当成传输失败重试（调用方在
 /// 传输失败分支的最前面查令牌）。
 async fn send_or_cancel(
-    transport: &TransportRequest,
+    network: &mut super::network_fallback::Fallback,
     telemetry: &crate::server::core::upstream::usage::RequestTelemetry,
 ) -> Result<reqwest::Response, super::request::UpstreamRequestError> {
     let Some(token) = telemetry.cancel_token() else {
-        return send_chat_request(transport).await;
+        return network.send().await;
     };
     tokio::select! {
-        result = send_chat_request(transport) => result,
+        result = network.send() => result,
         _ = token.cancelled() => Err(super::request::UpstreamRequestError {
             message: cancellation::MANUAL_TERMINATED.to_string(),
             reason: cancellation::MANUAL_TERMINATED.to_string(),
             safe_to_retry: false,
+            network_failure: false,
         }),
     }
 }
@@ -2919,7 +2846,9 @@ async fn send_with_retry(
     telemetry: &std::sync::Arc<crate::server::core::upstream::usage::RequestTelemetry>,
     degraded: bool,
     images: Option<crate::server::core::providers::images::ImageResponseKind>,
+    network: Option<&crate::server::core::providers::policy::NetworkPolicy>,
 ) -> Result<super::images::ImageResponse, OutboundFailure> {
+    let mut network = super::network_fallback::Fallback::new(transport, if images.is_some() { None } else { network });
     loop {
         // 手动终止：发送前先看令牌（退避睡眠 / 上一轮失败之后回到这里）。
         // 出口是 `cancelled_failure`，但调用方（attempt_queue）在分类动作之前
@@ -2933,7 +2862,13 @@ async fn send_with_retry(
         // 睡醒重发时必须推回去 —— 否则那一段等待首字节的时间会被显示成
         // 「重试中」，而它其实已经在等上游出字了。
         telemetry.note_phase(LogPhase::Waiting);
-        let response = match send_or_cancel(transport, telemetry).await {
+        if let Some(capture) = capture {
+            let actual = network.transport();
+            if let Ok(body) = serde_json::from_str::<Value>(&actual.payload) {
+                capture.reset_request(&actual.url, adapter.provider_id(), &actual.headers, &body);
+            }
+        }
+        let response = match send_or_cancel(&mut network, telemetry).await {
             Ok(response) => {
                 telemetry.note_attempt_response();
                 response
@@ -2954,10 +2889,15 @@ async fn send_with_retry(
                         },
                         error: gateway,
                         stop: true,
+                        policy: Default::default(),
                     });
                 }
                 // 传输层失败（DNS/代理/连接）：按设置退避重发，吸收链路抖动；
                 // 次数用完才收敛成 502，与改造前的兜底一致
+                if let Some(reason) = network.after_transport(&error).await {
+                    telemetry.note_attempt_retry(&reason, None, 0);
+                    continue;
+                }
                 if let Some(advice) = transport_retry_advice(&error, budget.remaining) {
                     budget.remaining -= 1;
                     let used = budget.used();
@@ -2978,6 +2918,7 @@ async fn send_with_retry(
                     },
                     error: gateway,
                     stop: false,
+                    policy: Default::default(),
                 });
             }
         };
@@ -3011,6 +2952,7 @@ async fn send_with_retry(
                         class,
                         error: if error.message.is_empty() { super::images::output_error(message) } else { error },
                         stop,
+                        policy: Default::default(),
                     });
                 }
             }
@@ -3025,18 +2967,13 @@ async fn send_with_retry(
             },
             error,
             stop: true,
+            policy: Default::default(),
         })?;
         if !is_error {
+            network.success();
             return Ok(super::images::ImageResponse::Live(response));
         }
         let status = response.status().as_u16();
-        // Retry-After 要在读 body **之前**取（`read_upstream_error` 会吃掉响应）：
-        // 空响应体的 429 没有可解析文案，但上游可能用这个头给出精确冷却时长。
-        let retry_after = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
         // 错误响应体的读取同样受「非流式响应超时」管（对应 OmniProxy
         // readBodyWithStallGuard 的用法之一）：上游接了错误响应却迟迟不吐完
         // 出错体时，不能让「读错误」把请求挂住 —— 读不出来就当上游没给细节，
@@ -3048,37 +2985,26 @@ async fn send_with_retry(
                 Err(_elapsed) => super::request::UpstreamErrorDetail {
                     code: None,
                     message: format!("非流式响应超时({}秒)", budget.as_secs()),
+                    payload: None,
                 },
             }
         };
         let body = detail.to_value();
-        let mut class = adapter.classify_error_async(status, &body).await;
-        class = empty_body_429_class(
-            class,
-            status,
-            &detail.message,
-            detail.code,
-            retry_after.as_deref(),
-            logging::now_ms(),
-        );
-        // 分类器没给出恢复时刻时，优先相信上游的 Retry-After（秒数或 HTTP 日期）；
-        // 都没有时 mark_account_limited 自己会落 10 分钟兜底冷却。
-        if let UpstreamErrorClass::QuotaLimited { reset_at: slot, .. } = &mut class {
-            if slot.is_none() {
-                if let Some(reset_at) =
-                    retry_after_reset_at(retry_after.as_deref(), logging::now_ms())
-                {
-                    *slot = Some(reset_at);
-                }
-            }
-        }
+        let class = adapter.classify_error_async(status, &body).await;
+        let policy = adapter.error_policy_async(status, &body).await;
         let decision = adapter
             .retry_decision_async(status, &body, budget.used(), budget.total)
             .await;
         let uncertain_image = images.is_some()
             && matches!(class, UpstreamErrorClass::Fatal { .. })
             && (status >= 500 || matches!(status, 408 | 409 | 425));
-        let stop = uncertain_image || matches!(&decision, RetryDecision::Stop { .. });
+        let stop = policy.stop || uncertain_image || matches!(&decision, RetryDecision::Stop { .. });
+        if let Some(reason) = network.after_status(status, &body,
+            !stop && !policy.suspend_account && policy.account_cooldown_until.is_none()
+                && matches!(class, UpstreamErrorClass::Fatal { .. })).await {
+            telemetry.note_attempt_retry(&reason, Some(i64::from(status)), 0);
+            continue;
+        }
         if uncertain_image {
             telemetry.note_attempt_notice("图片请求结果不确定，未自动重发，以免重复消耗额度");
         }
@@ -3102,7 +3028,7 @@ async fn send_with_retry(
         // 上，直接换下一个账号继续试（见 `direct_switch_status` 与动作 3），
         // 换满仍失败才把错误给客户端。两处合起来才是「这个码直接换号」的
         // 完整语义。
-        let advice = if stop
+        let advice = if stop || policy.suspend_account || policy.account_cooldown_until.is_some()
             || (!degraded && matches!(class, UpstreamErrorClass::ContentBlocked { .. }))
             || direct_switch_status(i64::from(status))
         {
@@ -3134,13 +3060,9 @@ async fn send_with_retry(
         );
         // 文案由适配器给出（含 provider 提示），编排层原样组装成网关错误
         let error = match &class {
-            UpstreamErrorClass::QuotaLimited { status, message, upstream_code, reset_at, .. } => {
-                let error = GatewayError::with_status(*status as i32, message.clone())
-                    .with_optional_code(*upstream_code);
-                match (*reset_at).map(|reset_at| (reset_at - logging::now_ms()) / 1000) {
-                    Some(seconds) if seconds > 0 => error.with_retry_after_seconds(seconds as u64),
-                    _ => error,
-                }
+            UpstreamErrorClass::QuotaLimited { status, message, upstream_code, .. } => {
+                GatewayError::with_status(*status as i32, message.clone())
+                    .with_optional_code(*upstream_code)
             }
             // 内容拦截与 Fatal 的客户端形态相同（状态码 + 上游原文 + 上游码）：
             // 区别只在**编排动作**（前者不罚账号、先换提示词补救），不在文案。
@@ -3153,7 +3075,7 @@ async fn send_with_retry(
                     .with_optional_code(*upstream_code)
             }
             UpstreamErrorClass::TokenExpired { message } => {
-                GatewayError::with_status(status as i32, message.clone())
+                GatewayError::with_status(401, message.clone())
                     .with_optional_code(detail.code)
             }
         };
@@ -3161,7 +3083,7 @@ async fn send_with_retry(
             GatewayError::with_status(error.status_code, format!("{}；图片请求可能已消耗额度，未自动重试", error.message))
                 .with_optional_code(error.upstream_code)
         } else { error };
-        return Err(OutboundFailure { class, error, stop });
+        return Err(OutboundFailure { class, error, stop, policy });
     }
 }
 
@@ -3244,96 +3166,5 @@ mod local_failure {
         let error = super::quota_refusal_error("内容拒答".to_string(), now + 90_000, false);
         assert_eq!(502, error.status_code);
         assert_eq!(None, error.retry_after_secs, "内容型不该带 Retry-After");
-    }
-
-    #[test]
-    fn retry_after_seconds_become_an_absolute_reset_moment() {
-        let now = 1_700_000_000_000i64;
-        // delay-seconds：30 秒后的绝对毫秒时刻
-        assert_eq!(
-            super::retry_after_reset_at(Some("30"), now),
-            Some(now + 30_000),
-            "整数字段应解释为相对秒数"
-        );
-        // 0 / 负数不作为恢复时刻 —— 让调用方落默认冷却
-        assert_eq!(super::retry_after_reset_at(Some("0"), now), None);
-        assert_eq!(super::retry_after_reset_at(Some("-5"), now), None);
-        // 畸形值不 panic，只返回 None
-        assert_eq!(super::retry_after_reset_at(Some("later"), now), None);
-        // HTTP-date（RFC 2822）同样被接受
-        assert_eq!(
-            super::retry_after_reset_at(Some("Wed, 01 Jan 2031 00:00:30 GMT"), now),
-            Some(1_924_992_030_000),
-        );
-        // 缺失头返回 None
-        assert_eq!(super::retry_after_reset_at(None, now), None);
-    }
-
-    #[test]
-    fn a_past_rfc2822_date_is_not_a_future_reset() {
-        let now = 1_700_000_000_000i64;
-        // 2000 年的日期远早于 now —— 不能把它当冷却恢复时刻
-        assert_eq!(
-            super::retry_after_reset_at(Some("Sat, 01 Jan 2000 00:00:00 GMT"), now),
-            None,
-        );
-    }
-
-    #[test]
-    fn an_empty_body_429_is_treated_as_short_quota_cooldown() {
-        use super::UpstreamErrorClass;
-
-        let now = 1_700_000_000_000i64;
-        let fatal = UpstreamErrorClass::Fatal {
-            status: 429,
-            message: String::new(),
-            upstream_code: None,
-        };
-        // 不带 Retry-After：reset_at 为 None，由 mark_account_limited 落默认冷却
-        let class = super::empty_body_429_class(fatal.clone(), 429, "", None, None, now);
-        assert!(
-            matches!(class, UpstreamErrorClass::QuotaLimited { status: 429, reset_at: None, .. }),
-            "空 body 429 必须归类为限额，才能触发冷却与换号，得到 {class:?}"
-        );
-        // 带 Retry-After：恢复时刻优先取上游给的秒数
-        let class = super::empty_body_429_class(fatal, 429, "", None, Some("30"), now);
-        match class {
-            UpstreamErrorClass::QuotaLimited { reset_at: Some(reset_at), status, .. } => {
-                assert_eq!(status, 429);
-                assert_eq!(reset_at, now + 30_000);
-            }
-            other => panic!("带 Retry-After 的空 429 应有精确恢复时刻，得到 {other:?}"),
-        }
-    }
-
-    #[test]
-    fn an_empty_body_429_does_not_overwrite_an_evidence_backed_class() {
-        use super::UpstreamErrorClass;
-
-        let now = 1_700_000_000_000i64;
-        // 插件已经给出有证据的限额分类：即使 body 为空也不能降级兜底折腾它
-        let quota = UpstreamErrorClass::QuotaLimited {
-            reset_at: Some(now + 3600_000),
-            message: "上游返回 429: quota exceeded".to_string(),
-            upstream_code: Some(429),
-            status: 429,
-        };
-        let class = super::empty_body_429_class(quota.clone(), 429, "", Some(429), None, now);
-        assert!(matches!(class, UpstreamErrorClass::QuotaLimited { .. }), "{class:?}");
-        // 失败但携带正文的 429 不是「空 body」，保持原来分类，不改写成限额
-        let fatal_with_text = UpstreamErrorClass::Fatal {
-            status: 429,
-            message: "上游返回 429: not rate limited after all".to_string(),
-            upstream_code: None,
-        };
-        let class = super::empty_body_429_class(
-            fatal_with_text.clone(),
-            429,
-            "not rate limited after all",
-            None,
-            None,
-            now,
-        );
-        assert!(matches!(class, UpstreamErrorClass::Fatal { status: 429, .. }), "{class:?}");
     }
 }

@@ -184,13 +184,6 @@ const BRIDGE_JS: &str = r#"
       }),
     getLoginState: () => invoke('login_state'),
     cancelLogin: () => invoke('cancel_login'),
-    // Qoder 网页 Cookie（积分到期明细）：壳打开内嵌登录窗口，读 HttpOnly
-    // Cookie 后交给网关保存。只支持桌面端；网页端/headless 用手动粘贴兜底。
-    captureQoderWebCookie: (accountId, provider) =>
-      invoke('capture_qoder_web_cookie', {
-        accountId: String(accountId || ''),
-        provider: String(provider || ''),
-      }),
     // ── AutoClaw 国际版 OAuth（**授权地址由界面先拿好**）──────────
     // 与 startLogin 的区别：那条是「壳去问后端要地址」，这条是「界面已经
     // 拿到地址了，壳只负责开窗口并等待」。原因是这条链前面有一次**必须在
@@ -305,10 +298,11 @@ const BRIDGE_JS: &str = r#"
     // 那是一次静默的数据丢失。
     getModelManage: () => call('GET', '/api/models/manage'),
     setModelState: payload => call('POST', '/api/models/state', payload),
-    addModelMapping: (alias, target, provider, reasoning, enabled) => call('POST', '/api/models/mappings', {
+    addModelMapping: (alias, target, provider, reasoning, enabled, create) => call('POST', '/api/models/mappings', {
       alias, target, provider,
       ...(reasoning === undefined ? {} : { reasoning }),
       ...(enabled === undefined ? {} : { enabled }),
+      ...(create === undefined ? {} : { create }),
     }),
     removeModelMapping: (alias, target, provider) => call('POST', '/api/models/mappings/remove', { alias, target, provider }),
     // 自定义模型（手动登记上游目录里没有的模型）。「移除」而不是「隐藏」——
@@ -371,6 +365,7 @@ const BRIDGE_JS: &str = r#"
     getRoutingSticky: model => call('GET', '/api/routing/sticky' + toQuery({ model })),
     clearRoutingSticky: payload => call('POST', '/api/routing/sticky/clear', payload || {}),
     getRoutingReplays: query => call('GET', '/api/routing/replays' + toQuery(query)),
+    getRoutingFlow: query => call('GET', '/api/routing/flow' + toQuery(query)),
     getRoutingTrace: query => call('GET', '/api/routing/trace' + toQuery(query)),
     getRoutingTraceRequest: query => call('GET', '/api/routing/trace/request' + toQuery(query)),
     setRoutingConfig: patch => call('PUT', '/api/routing', patch || {}),
@@ -846,6 +841,14 @@ const BRIDGE_JS: &str = r#"
     // 次数 / 单次秒数，存配置（/api/queue）。契约同 saveTimeouts。
     getQueue: () => call('GET', '/api/queue'),
     saveQueue: patch => call('PUT', '/api/queue', patch),
+
+    // ── 会话图片压缩（设置页「网关 → 图片压缩」）──
+    // 开关 + 长边 / 质量 / 阈值三项，存配置（/api/image-compress）。契约同
+    // saveQueue：PUT 允许部分字段，返回生效后的全量值。只作用在对话链路
+    // （生图 / 图片编辑走独立分支，不经过压缩）。与 web_shim.rs 的同名方法
+    // 逐字同形（漏一侧 = 设置页那一格读不到值）。
+    getImageCompress: () => call('GET', '/api/image-compress'),
+    saveImageCompress: patch => call('PUT', '/api/image-compress', patch),
 
     // ── 验证码令牌池（设置页「网关 → 验证码令牌池」）──
     // ZCode 活动套餐通道令牌池的补货节奏（目标 / 轮询间隔 / 单轮上限），

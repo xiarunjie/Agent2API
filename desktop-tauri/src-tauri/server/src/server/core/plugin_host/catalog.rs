@@ -154,7 +154,7 @@ async fn fetch_catalog(channels: crate::server::config::UpdateChannels) -> Resul
     let current = super::host_target();
     let mut plugins = Vec::new();
     for entry in entries {
-        let detail = update::read_detail_in(entry.index_url.as_deref(), &entry.manifest).await;
+        let detail = update::read_detail(&entry.manifest).await;
         let repo = if entry.repo.is_empty() {
             detail
                 .as_ref()
@@ -172,20 +172,15 @@ async fn fetch_catalog(channels: crate::server::config::UpdateChannels) -> Resul
             .cloned()
             .unwrap_or_else(|| Value::Null);
         let icon = if icon.is_null() {
-            json!(update::read_store_icon_in(entry.index_url.as_deref(), &entry.icon).await)
+            json!(update::read_store_icon(&entry.icon).await)
         } else {
             icon
         };
-        let author = entry.author.clone().unwrap_or_else(|| {
-            if entry.official { "Agent2API".to_string() } else { "第三方".to_string() }
-        });
         let installed = packs.iter().find(|pack| pack.id == entry.id);
         let mut value = json!({
             "id": entry.id, "name": entry.name, "description": entry.description,
             "official": entry.official, "homepage": detail.as_ref().map(|detail| &detail.homepage),
-            "author": author, "publisher": author,
-            "protocol": detail.as_ref().map(|detail| detail.protocol),
-            "icon": icon,
+            "protocol": detail.as_ref().map(|detail| detail.protocol), "icon": icon,
             "requireSigned": entry.require_signed || detail.as_ref().is_some_and(|detail| detail.require_signed),
             "version": Value::Null, "page": Value::Null, "notes": "", "prerelease": false,
             "platforms": [], "error": false, "reason": Value::Null,
@@ -313,6 +308,7 @@ async fn apply_automatic() {
             continue;
         };
         if entry["error"] == true
+            || super::operations::active(id)
             || entry["official"] != true
             || entry["version"].as_str().is_none()
         {
@@ -359,9 +355,6 @@ async fn apply_automatic() {
         {
             logging::verbose("[Plugin]", &format!("自动处理 {id}：{error}"));
             continue;
-        }
-        while super::operations::active(id) {
-            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 }

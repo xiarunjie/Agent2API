@@ -84,41 +84,6 @@ impl RequestStats {
         file_size(&file) + file_size(&PathBuf::from(format!("{}-wal", file.to_string_lossy())))
     }
 
-    /// 库内空闲页读数：`(空闲页数, 总页数, 可回收字节数)`；库不可用时返回 `None`。
-    ///
-    /// ── 为什么需要这个读数 ──────────────────────────────────────
-    /// 库开了 `auto_vacuum=0`（见 `db::apply_pragmas`），删除行只把页标成空闲，
-    /// 文件**不会缩小**。用户删掉大量历史正文（或 v13 升级清了整张
-    /// `request_raw`）之后，库里会留下成千上万个空闲页：文件看着还是 2.5GB，
-    /// 实际数据只有 1.1GB。这份「虚胖」在设置页原样显示成占用，用户既看不到
-    /// 原因，也找不到该不该压缩的依据 —— 实测出现过「库里 1.3GB 是空洞，
-    /// 用户以为程序在偷偷占盘」（C 盘爆满）。
-    ///
-    /// 因此把判据暴露出来：只有占比够高（调用方决定阈值）时才值得付一次
-    /// VACUUM 的代价。`PRAGMA freelist_count` 与 `page_count` 都是 O(1) 的
-    /// 头字段读，不扫表，可以放在概览接口里。
-    ///
-    /// 由调用方传入自己持有的 `guard`（与 `with_conn` 同形）：`stats()` 要在
-    /// **同一次持锁**里既读条数又读空洞，保证这一行里的两个数字出自同一份
-    /// 快照。这里若自己去 `guard()` 会二次加锁 —— 那把 `Mutex` 不可重入，
-    /// 在 `stats()` 里调用会当场死锁。三行 PRAGMA 都是读，与记账事务只会
-    /// 排队、不会互相阻塞出问题。
-    pub(super) fn free_space(
-        &self,
-        guard: &std::sync::MutexGuard<'_, ()>,
-    ) -> Option<(u64, u64, u64)> {
-        self.with_conn(guard, |conn| {
-            let page_size: i64 = conn.query_row("PRAGMA page_size;", [], |row| row.get(0))?;
-            let page_count: i64 = conn.query_row("PRAGMA page_count;", [], |row| row.get(0))?;
-            let free: i64 = conn.query_row("PRAGMA freelist_count;", [], |row| row.get(0))?;
-            Ok::<_, rusqlite::Error>((
-                free.max(0) as u64,
-                page_count.max(0) as u64,
-                (page_size.max(0) as u64) * (free.max(0) as u64),
-            ))
-        })
-    }
-
     /// 压缩数据库：`checkpoint(TRUNCATE)` → `VACUUM` → 再 `checkpoint(TRUNCATE)`
     /// —— 首尾两次 checkpoint 缺一不可（理由见下），中间那次 VACUUM 重建整库
     /// 文件回收空闲页。**后台线程**执行，返回启动结果。
@@ -165,13 +130,16 @@ impl RequestStats {
         let vacuum = Arc::clone(&self.vacuum);
         std::thread::spawn(move || {
             let outcome = db.with(|conn| -> rusqlite::Result<()> {
+                db.invalidate_accounts();
                 conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
                 conn.execute_batch("VACUUM;")?;
                 // 尾部 checkpoint：把 VACUUM 写进 WAL 的那份整库并回主库并截零。
                 // 少了它，回收的空间只从主库搬到 `-wal`，总占用不降反升（#297）。
                 conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+                db.invalidate_accounts();
                 Ok(())
             });
+            db.invalidate_accounts();
             let ok = matches!(outcome, Some(Ok(())));
             // 先复位状态再打日志：日志要写同一个库（拿锁），若先打日志，
             // 状态会多卡一会儿；复位后的并发压缩请求与日志写入互不阻塞

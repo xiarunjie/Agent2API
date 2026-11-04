@@ -3,11 +3,16 @@ import type { AccountRecord, AccountSorting } from './accounts-shared'
 
 export type RouteOrderChange = { kind: 'provider' } | { kind: 'account'; provider: string }
 
+export type RouteProviderScope = 'all' | 'selected'
+
 export type RouteProfile = {
+  providerScope?: RouteProviderScope
   providers: string[]
   disabledProviders: string[]
   accountOrder: Record<string, string[]>
   excludedAccounts: string[]
+  strategy?: string
+  sticky?: string
 }
 export type RouteEntry = {
   id: string
@@ -26,6 +31,9 @@ export type RouteDecision = {
   picked?: string
   scope?: string
   stickyId?: string
+  sessionId?: string
+  sessionSource?: string
+  configSnapshot?: { capturedAt: number; scope: string; strategy: string; sticky: string; providerScope?: RouteProviderScope; accountCount?: number; providerCount?: number }
   orderedTotal?: number
   blockedTotal?: number
   ordered?: RouteEntry[]
@@ -48,11 +56,15 @@ export type RoutingWorkspace = {
   configuredModels: string[]
   models: string[]
   profile: RouteProfile
+  inheritedProfile?: RouteProfile
   providers: Array<{ id: string; label: string; accountCount: number; custom: boolean; available: boolean }>
   accounts: AccountRecord[]
   sorting: AccountSorting
-  queue: { strategy: string; sticky: string; pickedId: string; ordered: RouteEntry[]; blocked: RouteEntry[] }
+  queue: { strategy: string; sticky: string; pickedId: string; ordered: RouteEntry[]; blocked: RouteEntry[]; lastRequestModel?: string }
   settings: RouteSettings
+  globalSettings?: RouteSettings
+  revision?: string
+  accountStates?: Record<string, { model: string; resetAt: number; limitedModels: number }>
   metrics: {
     available?: boolean
     running?: number
@@ -135,7 +147,8 @@ export type StickyEntry = {
 }
 export type RoutingBridge = {
   getRoutingWorkspace(model?: string): Promise<RoutingWorkspace>
-  saveRoutingProfile(payload: { model: string | null; profile: RouteProfile | null; orderChange?: RouteOrderChange }): Promise<RoutingWorkspace>
+  getRoutingFlow(query: import('./routing-flow-types').FlowQuery): Promise<import('./routing-flow-types').FlowSnapshot & import('./routing-flow-types').FlowDetails>
+  saveRoutingProfile(payload: { model: string | null; profile: RouteProfile | null; orderChange?: RouteOrderChange; revision?: string }): Promise<RoutingWorkspace>
   setRoutingConfig(patch: Partial<RouteSettings>): Promise<RouteSettings>
   getRoutingReplays(query: { model?: string; offset: number; limit: number; status?: string }): Promise<{ entries: ReplayRow[]; matched: number; available?: boolean }>
   getRoutingTrace(query: { model?: string; offset: number; limit: number; status?: string; search?: string; startDate?: string; endDate?: string }): Promise<{ entries: ReplayRow[]; matched: number; available?: boolean }>

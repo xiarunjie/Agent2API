@@ -56,6 +56,8 @@ export type Account = {
   isGuest?: boolean
   /** 按模型记的限流记录 */
   rateLimits?: Record<string, RateLimitInfo>
+  upstreamCooldownUntil?: number | null
+  upstreamBlockedReason?: string
   [key: string]: unknown
 }
 
@@ -277,10 +279,28 @@ export type ManageModel = {
   upstreamStatus?: 'undeployed' | null
   capabilities?: unknown
   reasoningLevels?: unknown
+  reasoningDefaultLevel?: unknown
+  reasoningFixedLevel?: unknown
+  reasoningBindingSupported?: unknown
+  reasoningSource?: unknown
   refreshedAt?: unknown
 }
 
-export type ManageView = { models?: ManageModel[] }
+export type ManageMapping = {
+  alias?: string
+  target?: string
+  provider?: string
+  enabled?: boolean
+  isDefault?: boolean
+  /**
+   * 这条映射**挂不到任何模型行**（目标上游不在清单里 = `dangling`，
+   * `carried: false` 时说明该上游已下线 / 改了 ID）。见桌面端
+   * `models-dangling.tsx` 的说明 —— 手机端只在模型页顶部提示 + 清理。
+   */
+  dangling?: boolean
+  carried?: boolean
+}
+export type ManageView = { models?: ManageModel[]; mappings?: ManageMapping[] }
 
 export function fetchManage(signal?: AbortSignal): Promise<ManageView> {
   return apiCall<ManageView>('/api/models/manage', { signal })
@@ -292,6 +312,18 @@ export function setModelEnabled(payload: {
   enabled: boolean
 }): Promise<ManageView> {
   return apiCall<ManageView>('/api/models/state', { method: 'POST', body: payload })
+}
+
+/**
+ * 删除一条映射（三元组定位）。手机端只用于清理「未挂载映射」——
+ * 常规的映射编辑仍在桌面端「模型管理」里做。
+ */
+export function removeModelMapping(payload: {
+  alias: string
+  target: string
+  provider?: string
+}): Promise<ManageView> {
+  return apiCall<ManageView>('/api/models/mappings/remove', { method: 'POST', body: payload })
 }
 
 export function refreshModels(): Promise<unknown> {
@@ -502,7 +534,7 @@ export function renameAccount(id: string, name: string): Promise<unknown> {
   return apiCall(`/api/accounts/${encodeURIComponent(id)}`, { method: 'PATCH', body: { name } })
 }
 
-/** 清除限流标记；不传 model = 清除该账号全部模型 */
+/** 不传 model 时清除账号冷却与全部模型限流标记。 */
 export function clearAccountRateLimits(id: string, model?: string): Promise<unknown> {
   return apiCall(`/api/accounts/${encodeURIComponent(id)}/rate-limits/clear`, {
     method: 'POST',

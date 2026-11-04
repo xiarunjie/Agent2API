@@ -8,8 +8,8 @@ function Card({ children, installed }: { children: React.ReactNode; installed?: 
   return <UiCard render={<article />} className={'flex flex-col ' + (installed ? 'border-success/40' : '')}>{children}</UiCard>
 }
 
-function CardHead({ id, name, version, icon, author, children }: {
-  id: string; name: string; version?: string | null; icon?: string | null; author?: string | null; children?: React.ReactNode
+function CardHead({ id, name, version, icon, children }: {
+  id: string; name: string; version?: string | null; icon?: string | null; children?: React.ReactNode
 }) {
   const title = pluginName(id, name)
   return <div className='flex gap-3 px-4 pt-4'>
@@ -21,14 +21,16 @@ function CardHead({ id, name, version, icon, author, children }: {
         {title}{version ? <span className='text-[11.5px] font-normal tabular-nums text-muted-foreground'>v{version}</span> : null}
       </h3>
       <div className='flex flex-wrap gap-1.5'>{children}</div>
-      {author ? <div className='text-[11px] text-muted-foreground'>{t('作者：{author}', { author })}</div> : null}
     </div>
   </div>
 }
 
 export function OperationProgress({ operation }: { operation: PluginOperation }) {
   const stage = operation.stage === 'downloading' ? t('正在下载…')
-    : operation.stage === 'verifying' ? t('正在校验包内容…') : t('正在安装…')
+    : operation.stage === 'verifying' ? t('正在校验包内容…')
+    : operation.stage === 'waiting' ? t('等待当前任务结束，插件继续服务…')
+    : operation.stage === 'loading' ? t('正在加载新插件…')
+    : operation.stage === 'restoring' ? t('正在恢复旧版本插件…') : t('正在安装…')
   const download = operation.stage === 'downloading'
   return <div className='px-4 pb-4 pt-3' aria-live='polite'>
     <div className='mb-1.5 flex items-center justify-between gap-2 text-[11.5px]'>
@@ -54,7 +56,7 @@ export function StorePluginCard({ item, target, operation, disabled, onInstall, 
   const platform = item.platforms.find(platform => platform.target === target)
   const installable = Boolean(item.version && platform && !item.error)
   return <Card>
-    <CardHead id={item.id} name={item.name} version={item.version} icon={item.icon} author={item.author || item.publisher}>
+    <CardHead id={item.id} name={item.name} version={item.version} icon={item.icon}>
       {item.official ? <Badge variant='brand'>{t('官方')}</Badge> : null}
       {item.prerelease ? <Badge variant='warning'>{t('beta 版')}</Badge> : null}
       {!item.version ? <Badge variant='outline'>{t('暂未发布')}</Badge> : null}
@@ -91,8 +93,7 @@ export function InstalledPluginCard({ pack, store, host, update, operation, disa
   const blocked = update?.error === true && !required
   const packHost = pack.host === undefined ? host : pack.host
   return <Card installed>
-    <CardHead id={pack.id} name={store?.name || pack.name} version={pack.version} icon={pack.icon || store?.icon}
-      author={store?.author || store?.publisher || pack.author || pack.publisher}>
+    <CardHead id={pack.id} name={store?.name || pack.name} version={pack.version} icon={pack.icon || store?.icon}>
       <Badge variant={pack.enabled ? 'default' : 'secondary'}>{pack.enabled ? t('已启用') : t('已停用')}</Badge>
       <Badge variant={pack.signed ? 'success' : 'warning'}>{pack.signed ? t('已签名') : t('未签名')}</Badge>
       {pack.version.includes('-') ? <Badge variant='warning'>{t('beta 版')}</Badge> : null}

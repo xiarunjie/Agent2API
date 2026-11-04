@@ -5,8 +5,8 @@ import {
   type HiddenAccountProvider, type HiddenAccountsSummary,
 } from './accounts-shared'
 import {
-  accountGroups, filterCounts, matchesFilter, positionMap, providerOf, providerSummaries,
-  defaultGroupSortRules, supportsCreditExpiry,
+  accountGroups, filterCounts, matchesFilter, positionMap, providerSummaries,
+  defaultGroupSortRules,
   type AccountFilter, type AccountGroup, type GroupSortRule, type TokenUsageLookup, type UsageLookup,
 } from './accounts-domain'
 
@@ -34,8 +34,8 @@ export type AccountsStore = {
   /** 余额查询在途的账号（行上那颗「余额」按钮的去重闸） */
   usageInflight: ReadonlySet<string>
   /**
-   * 组头「可用合计」是否只累加**当前筛选 / 搜索后可见的行**。
-   * 默认关闭（= 按整组求和，见 accounts-panels 的 groupBalanceOf）；开关在
+   * 组头读数（可用合计 / 可用最低）是否只统计**当前筛选 / 搜索后可见的行**。
+   * 默认关闭（= 按整组统计，见 accounts-panels 的 groupBalanceOf）；开关在
    * 设置 → 显示 → 账号列表里。与 namesHidden 同属「怎么看这张表」的偏好。
    */
   groupTotalFiltered: boolean
@@ -54,7 +54,7 @@ const COLLAPSED_KEY = 'workbuddy-desktop-accounts-collapsed'
  *  这是「怎么看这张表」的偏好，与列宽同一档，存 localStorage 跨次启动保留 */
 const NAMES_HIDDEN_KEY = 'workbuddy-desktop-accounts-names-hidden'
 /**
- * 组头合计的口径开关：`'1'` = 只加当前筛选后的可见行，缺省 / 其它 = 整组求和。
+ * 组头读数的口径开关：`'1'` = 只统计当前筛选后的可见行，缺省 / 其它 = 整组统计。
  *
  * 这个键是账号页与设置页**共用的契约**：两边都经本文件的 `readGroupTotalFiltered` /
  * `setGroupTotalFiltered` 读写，不各自写一份字面量 —— 分开写的话，改键名时漏一处
@@ -289,31 +289,15 @@ export function groupView(
   return { groups, allGroups }
 }
 
-/**
- * 这一家此刻是否有「积分到期时间」的排序依据。
- *
- * Qoder 的到期数据依赖账号级网页 Cookie；组内一个 Cookie 都没有时，
- * 不能让默认规则显示成「到期 近→远」。其他家没有这个账号级前提，保持原行为。
- */
-function creditAvailableForProvider(provider: string): boolean {
-  if (!supportsCreditExpiry(provider)) return false
-  if (provider !== 'qoder' && provider !== 'qoder-intl') return true
-  return allAccounts().some(account => providerOf(account) === provider && account.hasWebCookie === true)
-}
-
-/** 已保存的选择优先；未配置的家按当前申报能力和账号前提生成默认规则。 */
+/** 已保存的选择优先；未配置的家按当前申报能力生成默认规则。 */
 export function groupSortRules(provider: string): GroupSortRule[] {
   const effective = store.sorting?.rules[provider] || snapshot()?.sorting?.rules[provider]
   const saved = effective || store.groupSort[provider]
-  const creditAvailable = creditAvailableForProvider(provider)
   if (saved) {
-    // 只压有效视图，不改落库配置：之后配置网页 Cookie，旧选择会自动恢复。
-    const rules = saved.map(rule => (
-      rule.key === 'credit' && !creditAvailable ? { ...rule, on: false } : { ...rule }
-    ))
-    return [...rules, ...defaultGroupSortRules(provider, creditAvailable).filter(rule => !rules.some(current => current.key === rule.key)).map(rule => ({ ...rule, on: false }))]
+    const rules = saved.map(rule => ({ ...rule }))
+    return [...rules, ...defaultGroupSortRules(provider).filter(rule => !rules.some(current => current.key === rule.key)).map(rule => ({ ...rule, on: false }))]
   }
-  return defaultGroupSortRules(provider, creditAvailable)
+  return defaultGroupSortRules(provider)
 }
 
 /** 这一家有没有**显式改过**规则（设置弹窗据此决定「恢复默认」是否可点） */

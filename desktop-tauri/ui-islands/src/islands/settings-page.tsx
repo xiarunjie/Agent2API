@@ -31,6 +31,7 @@ import {
 import {
   CATEGORIES,
   CAPTCHA_POOL_FIELDS,
+  IMAGE_COMPRESS_FIELDS,
   modelsDevStateText,
   NOTES,
   PROMPT_MODES,
@@ -69,6 +70,7 @@ import {
   panelLogout,
   refreshDebug,
   refreshDeveloperRoleCompat,
+  refreshImageCompress,
   refreshClineHeaders,
   refreshZcodeVersion,
   refreshCors,
@@ -99,6 +101,8 @@ import {
   saveCors,
   saveCaptchaPoolField,
   saveDebug,
+  saveImageCompressEnabled,
+  saveImageCompressField,
   saveModelsDev,
   savePromptFile,
   savePromptMode,
@@ -455,12 +459,10 @@ function GeneralPane({ snap }: { snap: SettingsSnapshot }) {
 
 /* ─── 显示分类 ─────────────────────────────── */
 
-/** 显示模式五档的状态行文案（五条文案在 settings-model 的 STATES 里） */
+/** 显示模式三档的状态行文案（三条文案在 settings-model 的 STATES 里） */
 function themeStateText(mode: ThemeMode): string {
   if (mode === 'light') return STATES.themeLight
   if (mode === 'dark') return STATES.themeDark
-  if (mode === 'maple-light') return STATES.themeMapleLight
-  if (mode === 'maple-dark') return STATES.themeMapleDark
   return STATES.themeSystem
 }
 
@@ -472,8 +474,8 @@ function themeStateText(mode: ThemeMode): string {
  *
  * 主题与缩放的**唯一应用入口都在 app.js**（见 settings-model 的显示偏好一节）：
  * 这里改完只调 wbApp.applyTheme / applyZoom，再靠 'wb:theme' / 'wb:zoom' 事件
- * 跟随。主题只有本页这一个入口（侧边栏底部那组三键已移除），监听事件的理由
- * 只剩下头内联脚本的抢先应用与其它窗口的写入。
+ * 跟随 —— 侧边栏底部的主题三键是同一个设置的另一个入口，两边必须互相同步；
+ * 谁也不去读对方的状态，只认事件里带的新值。
  *
  * 网页端：主题照常可用（data-theme 是纯 CSS 生效，窗口主题在 shim 里是空实现）；
  * 界面缩放禁用 —— 浏览器里的缩放归浏览器自己的 Ctrl +/- 管。
@@ -488,7 +490,7 @@ function DisplayPane() {
   // 端别取自桥（platform）而不是 navigator：与设置页其它端别判断同一口径
   const isWeb = shared().workbuddyDesktop?.platform === 'web'
 
-  // 跟随别的入口的改动（index.html 头部内联脚本的抢先应用、其它窗口的写入）：
+  // 跟随别人的改动（侧边栏三键、index.html 头部内联脚本的抢先应用、或本页自身）：
   // 事件里带着新值，直接采纳，不必回头读 localStorage
   React.useEffect(() => {
     const onTheme = (event: Event) => setTheme(String((event as CustomEvent).detail || 'system') as ThemeMode)
@@ -1253,6 +1255,43 @@ function GatewayPane({ snap, panels }: { snap: SettingsSnapshot; panels: Set<str
         </CardContent>
       </Card>
 
+      <Card render={<section />} className='panel'>
+        <PanelHead
+          title={t('图片压缩')}
+          tip={TIPS.imageCompress}
+          badge={snap.imageCompress.status === 'unavailable'
+            ? <StatusBadge tone='bad'>{t('不可用')}</StatusBadge>
+            : <StatusBadge tone={snap.imageCompress.enabled ? 'ok' : 'idle'}>
+                {snap.imageCompress.enabled ? t('已开启') : t('已关闭')}
+              </StatusBadge>}
+          actions={<RefreshButton id='btn-image-compress-refresh' onClick={() => void refreshImageCompress()} />}
+        />
+        <CardContent className='panel-body'>
+          <div className='settings-switches'>
+            <SwitchRow
+              id='settings-image-compress'
+              label={t('转发前压缩对话里内嵌的大图（只改发给上游的副本，生图与图片编辑不受影响）')}
+              checked={snap.imageCompress.enabled}
+              // 读到后端值之前不许切（与 developerRoleCompat 同一取舍）
+              disabled={snap.imageCompress.status !== 'ready' || snap.busy === 'imageCompress'}
+              onCheckedChange={next => void saveImageCompressEnabled(next)}
+            />
+          </div>
+          <div className='retention-list'>
+            {IMAGE_COMPRESS_FIELDS.map(field => (
+              <NumberRow
+                key={field.key}
+                field={field}
+                value={snap.imageCompress.values?.[field.key] ?? null}
+                disabled={snap.busy === 'imageCompress'}
+                onCommit={raw => saveImageCompressField(field, raw)}
+              />
+            ))}
+          </div>
+          <div className='hint retention-note'>{NOTES.imageCompress}</div>
+        </CardContent>
+      </Card>
+
       {/* 验证码令牌池：池子本体在 ZCode 插件里，网关只有节奏设置。
           插件没申报（没装 / 没装 ZCode）时这块不出现。 */}
       {panels.has('captcha_pool') ? (
@@ -1930,21 +1969,6 @@ function DataPane({ snap }: { snap: SettingsSnapshot }) {
                   {counts ? formatBytes(storage.bytes) : '—'}
                 </span>
               </span>
-            {/* 空洞读数：只在确实有可回收空间时出现 —— 0 时多一行「可回收 0 B」
-                只会让用户以为这里坏了。占比过低（<1%）时压缩也不值得，
-                与后端「只有占比够高才值得 VACUUM」的口径一致。 */}
-            {counts && storage.reclaimableBytes > 0 && storage.freePageRatio >= 0.01 ? (
-              <div className='retention-row'>
-                <Label htmlFor='storage-db-reclaim'>{t('可回收空洞')}</Label>
-                <span className='storage-line'>
-                  <span className='storage-path' id='storage-db-reclaim'>
-                    {formatBytes(storage.reclaimableBytes)}
-                    {` (${Math.round(storage.freePageRatio * 100)}%)`}
-                  </span>
-                </span>
-                <div className='hint'>{NOTES.storageReclaim}</div>
-              </div>
-            ) : null}
               <div className='hint'>{NOTES.storageSize}</div>
             </div>
           </div>

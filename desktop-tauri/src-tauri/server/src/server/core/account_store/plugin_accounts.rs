@@ -36,6 +36,8 @@ const SKELETON_KEYS: &[&str] = &[
     "addedAt",
     "updatedAt",
     "rateLimits",
+    "upstreamCooldownUntil",
+    "upstreamBlockedReason",
     "limiterGroups",
     "limiters",
     "lowBalance",
@@ -139,8 +141,7 @@ impl AccountStore {
     /// 「第三方插件读不到内置家账号」不冲突 —— 那个保证由 provider 路由维持，
     /// 不是靠「字段里没有 pluginSecret」。
     pub fn plugin_account(&self, id: &str) -> Option<Value> {
-        let guard = self.guard();
-        let record = self.record_by_id(&guard, id)?;
+        let record = self.read_record(id)?;
         let secret = secret_of(&record);
         let public = self.public_account(&record);
         let config = record
@@ -149,7 +150,6 @@ impl AccountStore {
             .cloned()
             .unwrap_or(Value::Null);
         // 出口不能并进 secret：代理池更新不应让凭证的比较再写失效。
-        drop(guard);
         let config = config
             .get("config")
             .filter(|value| value.is_object())
@@ -213,9 +213,7 @@ impl AccountStore {
     /// 读的是**投影列**（`record.provider()`），不解析 `pluginSecret`
     /// —— 归属是网关的事实，不是插件的事实。
     pub fn account_provider_of(&self, id: &str) -> Option<String> {
-        let guard = self.guard();
-        let record = self.record_by_id(&guard, id)?;
-        Some(record.provider().to_string())
+        self.route_account(id)?.get("provider")?.as_str().map(str::to_string)
     }
 
     /// 反查账号 id：按 (provider, uid) 定位。
@@ -237,8 +235,7 @@ impl AccountStore {
     /// 账号的签到 / 余额链路整体报「找不到该会话对应的账号记录」—— 而它们
     /// 转发完全正常，用户看到的是一个自相矛盾的状态。
     pub fn account_id_of_identity(&self, provider: &str, uid: &str) -> Option<String> {
-        let guard = self.guard();
-        let records = self.records_for_provider(&guard, provider);
+        let records = self.read_provider(provider);
         let uid = uid.trim();
         if uid.is_empty() {
             return None;
@@ -259,11 +256,9 @@ impl AccountStore {
             return None;
         }
         let expected = format!("user-{uid}");
-        let guard = self.guard();
-        self.records_for_provider(&guard, provider)
-            .into_iter()
-            .find(|record| record.id() == expected)
-            .map(|record| record.id().to_string())
+        self.route_account(&expected).filter(|account| {
+            account.get("provider").and_then(Value::as_str) == Some(provider)
+        }).map(|_| expected)
     }
 
     /// 比较-再写凭证。
@@ -376,6 +371,18 @@ impl AccountStore {
             return Err(format!("账号 {id} 不存在"));
         };
         let key = format!("{LEDGER_PREFIX}{kind}");
+        if kind == super::checkin_state::LEDGER_KIND {
+            let previous_at = record.get(&key).and_then(|state| state.get("at")).and_then(Value::as_i64);
+            let next_at = value.get("at").and_then(Value::as_i64);
+            if previous_at.zip(next_at).is_some_and(|(previous, next)| next < previous) {
+                return Ok(());
+            }
+            let checkin_at = record.checkin_at();
+            super::checkin_state::apply(&mut record, value)?;
+            if record.get(&key) == Some(value) && record.checkin_at() == checkin_at {
+                return Ok(());
+            }
+        }
         record.set(&key, value.clone());
         // 两种名称指向同一份结清记忆，写入和清除必须同步。
         let alias = match kind {
@@ -386,7 +393,9 @@ impl AccountStore {
         if let Some(alias) = alias {
             record.set(&format!("{LEDGER_PREFIX}{alias}"), value.clone());
         }
-        record.set_updated_at(logging::now_ms());
+        if kind != super::checkin_state::LEDGER_KIND {
+            record.set_updated_at(logging::now_ms());
+        }
         self.with_conn(&guard, |conn| {
             crate::server::core::account_store::sql::update_in_place(conn, &record)
         })

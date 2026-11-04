@@ -2,12 +2,14 @@ import * as React from 'react'
 import { createRoot } from 'react-dom/client'
 import { Badge, Button, Progress , Card, CardHeader, CardContent } from '@ui'
 import {
-  errorMessage, handleExternalClick, markdownHtml, safeExternal, shared, toast,
+  downloadAsset, errorMessage, handleExternalClick, isSelfUpdate, markdownHtml,
+  missingAssetReasonFor, safeExternal, shared, toast,
   type DownloadTask, type UpdateInfo,
 } from './update-shared'
 import { showUpdateModal } from './update-modal'
 import { UpdateSettingsDialog } from './update-settings'
 import { QqGroupDialog } from './update-qq-group'
+import { SupportDialog } from './update-support-dialog'
 import { t } from '../i18n'
 import { HtmlContent } from '@ui'
 import { Empty } from '@ui'
@@ -177,23 +179,9 @@ function installerKindOf(info: UpdateInfo | null): InstallerKind {
 }
 
 /**
- * 容器内更新（Linux headless / Docker）与桌面安装包是**两条不同的路**，全文件
- * 按这一个判定分流：桌面端 selfUpdate 恒为 false，下面每个分支都原样走回旧行为。
- *
- *   · 桌面：后端给 `asset`（NSIS / dmg / deb / AppImage 安装器）→ 下载 → 由壳
- *     启动安装程序（见 run_installer）；
- *   · 容器：后端给 `serverAsset`（服务端更新包）→ 下载 → 服务端自己原地替换
- *     二进制与 ui 目录 → 重启进程（容器 restart 策略拉起）。
+ * 本次要下载的资产与「容器还是桌面」的分流都在 update-shared.ts
+ * （isSelfUpdate / downloadAsset —— 弹窗也要用，只此一份）。
  */
-function isSelfUpdate(info: UpdateInfo | null | undefined): boolean {
-  return info?.selfUpdate === true
-}
-
-/** 本次要下载的资产：容器内更新取服务端包，桌面取安装器 */
-function downloadAsset(info: UpdateInfo | null | undefined): { url?: string; name?: string } | null {
-  if (!info) return null
-  return isSelfUpdate(info) ? (info.serverAsset ?? null) : (info.asset ?? null)
-}
 
 /** 「开始下载」时的提示：说明下载完会发生什么 */
 function downloadHint(info: UpdateInfo | null): string {
@@ -389,9 +377,22 @@ function renderCheckResult(): void {
     // 容器内更新：该版本没挂服务端更新包时（老 Release / 只发了桌面安装包），
     // 按钮不会出现 —— 把原因与手动命令说清楚，别让人对着没有按钮的面板猜
     if (isSelfUpdate(info) && !info.serverAsset) {
-      setState(t('发现新版本 {latest}（当前 {current}），但该版本没有提供容器内更新包；请在宿主机执行 docker compose pull && docker compose up -d 升级。{at}', {
+      setState(t('发现新版本 {latest}（当前 {current}），但该版本没有提供容器内更新包（{reason}）；请在宿主机执行 docker compose pull && docker compose up -d 升级。{at}', {
         latest: String(info.latestVersion || ''),
         current: String(info.currentVersion || ''),
+        reason: missingAssetReasonFor(info),
+        at,
+      }))
+      return
+    }
+    // 桌面端同理：这一版没挂本机的安装包（构建漏传 / 命名不对 / 被更新源挡掉）
+    // 时按钮同样不出现，必须在这里把原因与「怎么办」交代掉 —— 否则用户对着
+    // 「发现新版本」四个字无从下手，而发布页上其实有得下
+    if (!downloadAsset(info)?.url) {
+      setState(t('发现新版本 {latest}（当前 {current}），但这一版没有提供本机安装包（{reason}）；可到 GitHub 发布页手动下载。{at}', {
+        latest: String(info.latestVersion || ''),
+        current: String(info.currentVersion || ''),
+        reason: missingAssetReasonFor(info),
         at,
       }))
       return
@@ -899,7 +900,12 @@ async function downloadOrCancel(): Promise<void> {
 
   const asset = downloadAsset(current.info)
   if (!asset?.url) {
-    toast(isSelfUpdate(current.info) ? t('这一版没有提供容器内更新包') : t('没有可下载的安装包'), 'err')
+    // 兜底提示（正常在面板上看不到这一步）：把**为什么**没有包一并说出来 ——
+    // 只丢一句「没有可下载的安装包」等于让人自己去猜是构建没传、还是被源挡了
+    const reason = missingAssetReasonFor(current.info)
+    toast(isSelfUpdate(current.info)
+      ? t('这一版没有提供容器内更新包：{reason}', { reason })
+      : t('没有可下载的安装包：{reason}', { reason }), 'err')
     return
   }
   // 按钮不可见就不该从这里发起下载（openAndDownload 的自动触发也走这条路）
@@ -1097,6 +1103,7 @@ function UpdatePanel() {
   // 「加入交流群」弹窗：入口在「关于作者」那一行的按钮组里，开关留在这一层
   // （弹窗经 Portal 挂 body，与面板同一棵 React 树即可）
   const [qqGroupOpen, setQqGroupOpen] = React.useState(false)
+  const [supportOpen, setSupportOpen] = React.useState(false)
 
   // 面板常驻（root 随应用生命周期），正常不会卸载；万一将来被卸载（骨架变化 / 页面
   // 重载），把进度轮询收掉 —— 悬挂的定时器会一直按 1 秒打后端
@@ -1199,12 +1206,10 @@ function UpdatePanel() {
           ? <Progress value={snap.percent} />
           : null}
 
-        {/* 关于作者 + 收藏项目：作者主页与仓库地址都从接口返回的 sourceRepository
-            现拼（fork 后自动指向 fork 者），拿到数据前整行不渲染 */}
-        {owner && repo ? (
-          <div className='update-author' id='update-author'>
-            <div className='update-author-text'>
-              <strong>{t('关于作者')}</strong>
+        <div className='update-author' id='update-author'>
+          <div className='update-author-text'>
+            <strong>{t('关于作者')}</strong>
+            {owner && repo ? (
               <span>
                 {t('本工具由')}{' '}
                 <a id='update-author-link' href={owner} data-external={owner} target='_blank' rel='noopener'>
@@ -1212,20 +1217,21 @@ function UpdatePanel() {
                 </a>{' '}
                 {t('个人开发并开源维护，免费使用，也不会收集你的账号数据。如果它帮到了你，欢迎到项目仓库点个 Star 支持一下。')}
               </span>
-            </div>
-            <div className='update-author-actions'>
-              {/* 「加入交流群」放在「收藏项目」左边：两个都是「去别处」的动作，
-                  排在同一行比散在更新日志页脚更好找。用 outline 而不是 link 变体 ——
-                  这一行是按钮组，两枚按钮同款才不显得一主一次 */}
-              <Button
-                type='button'
-                size='sm'
-                variant='outline'
-                title={t('QQ 群 / Telegram 都在这里')}
-                onClick={() => setQqGroupOpen(true)}
-              >
-                {t('加入交流群')}
-              </Button>
+            ) : (
+              <span>{t('Agent2API 一直在更新，是因为有人在背后持续投入。如果它帮到了你，欢迎请作者喝杯咖啡。')}</span>
+            )}
+          </div>
+          <div className='update-author-actions'>
+            <Button
+              type='button'
+              size='sm'
+              variant='outline'
+              title={t('QQ 群 / Telegram 都在这里')}
+              onClick={() => setQqGroupOpen(true)}
+            >
+              {t('加入交流群')}
+            </Button>
+            {owner && repo ? (
               <Button
                 id='btn-update-favorite'
                 type='button'
@@ -1236,9 +1242,21 @@ function UpdatePanel() {
               >
                 {t('收藏项目')}
               </Button>
-            </div>
+            ) : null}
+            <Button
+              id='btn-update-support'
+              type='button'
+              size='sm'
+              variant='outline'
+              onClick={() => setSupportOpen(true)}
+            >
+              <svg viewBox='0 0 24 24' width='14' height='14' fill='none' stroke='currentColor' strokeWidth='1.8' strokeLinecap='round' strokeLinejoin='round' aria-hidden='true'>
+                <path d='M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1.1-1.1a5.5 5.5 0 0 0-7.8 7.8L12 21l8.8-8.6a5.5 5.5 0 0 0 0-7.8Z' />
+              </svg>
+              {t('支持作者')}
+            </Button>
           </div>
-        ) : null}
+        </div>
 
         {/* 更新日志：只展示最新一次发布的说明，数据来自「检查更新」的结果
             （与上方「最新版本」同源） */}
@@ -1267,6 +1285,7 @@ function UpdatePanel() {
       ) : null}
       {/* 「加入交流群」：QQ 群号（可复制）+ Telegram 外链 */}
       {qqGroupOpen ? <QqGroupDialog open onClose={() => setQqGroupOpen(false)} /> : null}
+      {supportOpen ? <SupportDialog open onClose={() => setSupportOpen(false)} /> : null}
     </Card>
   )
 }

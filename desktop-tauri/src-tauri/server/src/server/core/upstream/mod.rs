@@ -51,12 +51,19 @@ pub mod connections;
 pub mod continuation;
 mod image_tasks;
 mod images;
+pub mod image_compress;
+mod multipart;
+mod native_tools;
+mod http_dns;
+mod network_fallback;
 pub mod refusal;
 pub mod request;
 mod payload;
 mod provider_loop;
 mod rotate;
 mod route_state;
+mod route_context;
+mod conversation_ids;
 mod route_sticky;
 pub mod sse;
 pub mod stall;
@@ -318,9 +325,7 @@ impl UpstreamService {
     }
 
     pub fn route_sticky_sessions(&self, model: Option<&str>, now: i64) -> Vec<Value> {
-        self.route.sticky_list(model, now, crate::server::core::routing::sticky_ttl_ms(
-            crate::server::config::routing_settings().sticky,
-        ))
+        self.route.sticky_list(model, now)
     }
 
     pub fn clear_route_sticky(&self, id: Option<&str>, model: Option<&str>) -> usize {
@@ -385,6 +390,11 @@ impl UpstreamService {
         if cancel.as_ref().is_some_and(|token| token.is_cancelled()) {
             return Err(cancellation::cancelled_error());
         }
+        let route_model = request.body.get("model").and_then(Value::as_str).unwrap_or("").to_string();
+        let route_store = self.store.clone();
+        let routing = crate::server::core::blocking::run(move || {
+            route_context::RequestRouting::capture(&route_model, &route_store)
+        }).await?;
         let mut slot = self.begin_slot(&request.dedupe_key, cancel.as_ref()).await;
         // 账号级活跃连接计数：**本请求**的凭证，随选路改绑到实际使用的账号。
         // 建在这里（而不是选路处）是因为它必须活到响应体发完 —— 流式路径由
@@ -423,6 +433,8 @@ impl UpstreamService {
         let sanitize = config.sanitize_settings();
         let developer_role_compat = config.developer_role_compat();
         let prompt = config.prompt_plan();
+        // 图片压缩设置是 `Copy`，拷一份随上下文带下去（不借用 config，省去生命周期约束）
+        let image_compress = *config.image_compress_settings();
         // Key 的提供商白名单随请求带进转发上下文：它要活过整条转发链
         //（含流式 —— 但流本身不需要它，只在选路与重试时读）。
         // 这里把 request 的字段**移出来**再借给 context：`request` 的其它部分
@@ -436,12 +448,14 @@ impl UpstreamService {
         let proxy_override = request.proxy_override;
         let context = payload::ProviderContext {
             body: &upstream_body,
+            routing,
             stream: request.stream,
             images,
             client_headers: &request.client_headers,
             telemetry: &request.telemetry,
             sanitize,
             developer_role_compat,
+            image_compress,
             prompt,
             preserve_system_prompt,
             key_scope: key_scope.as_ref(),

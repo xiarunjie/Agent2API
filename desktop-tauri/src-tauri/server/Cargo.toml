@@ -1,6 +1,6 @@
 [package]
 name = "agent2api-server"
-version = "3.3.0-beta.6"
+version = "3.4.0"
 description = "Agent2API 网关本体 — AI 路由网关与 Agent 客户端接管（桌面端与 headless 服务器共用）"
 authors = ["Agent2API"]
 edition = "2021"
@@ -67,7 +67,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 # agent2api-provider-protocol = { path = "../Agent2Providers/crates/provider-protocol" }
 # ```
 # 不要改这一行 —— 那会让干净 clone 的构建依赖某个人的磁盘布局。
-agent2api-provider-protocol = { git = "https://github.com/ProvidersPlugin/Agent2Providers", tag = "v3.3.0-beta.6" }
+agent2api-provider-protocol = { git = "https://github.com/ProvidersPlugin/Agent2Providers", tag = "v3.4.0" }
 # Qoder 国际版签到的 UMID 组件安装（providers/qoder/risk.rs）：官方 qodercli
 # npm 包是 .tgz（gzip + tar），解出内嵌的 runtime-info 二进制。flate2 已在
 # 依赖树里（image 拉的），声明出来直接复用；tar 解析手写（几十行，见 risk.rs）
@@ -80,7 +80,7 @@ axum = { version = "0.8", features = ["multipart"] }
 # 供登录链路与 Antigravity 未配代理的账号使用）依赖它 —— 显式出口（直连 /
 # 指定代理）都显式关掉了自动探测（见 `egress::build_client`），转发链路的
 # 「直连就是直连」语义不受影响。
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks", "system-proxy"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls", "socks", "system-proxy"] }
 # MonkeyCode 会话转发的 WebSocket 任务流（providers/monkeycode/stream.rs）：
 # 上游是 `wss://…/api/v1/users/tasks/stream`，TLS 走 rustls —— 与 reqwest 的
 # `rustls-tls` 同一条栈（rustls + tokio-rustls 各一份；根证书同为 webpki-roots
@@ -177,6 +177,34 @@ windows = { version = "0.61", features = [
 # 但只链 Win32_System_Services / Foundation 等少数模块，体积影响可忽略；
 # 且仅 Windows 目标编译，Linux / Docker 构建完全不受影响。
 windows-service = "0.8"
+
+# 全局内存分配器（Issue #420）：**仅 Linux 目标**换成 jemalloc。
+#
+# ── 为什么只在 Linux ────────────────────────────────────────
+# 受益的是长时间运行、多账号并发转发的部署形态（Docker 容器 / Linux 服务端），
+# 也就是 Issue 里说的小内存 VPS / NAS 场景。Windows 服务端与桌面端保持 Rust
+# 默认分配器不动 —— 它们的链接形态（桌面端只链本 crate 的**库**，不链下面那个
+# bin）本来也不会走到这个分配器。
+#
+# ── 为什么是 jemalloc 而不是 mimalloc ───────────────────────
+# 两者都能压住 glibc malloc 在长稳多线程下的碎片，但构建方式不同：
+# mimalloc 的 C 源码走 **cmake**，而本仓镜像的 arm64 交叉编译链路只配了 `cc`
+# （rusqlite / ring 靠它，见根目录 Dockerfile）；jemalloc 走的正是 `cc` + `make`
+# （tikv-jemalloc-sys 的 build.rs 用 cc::Build 找编译器），与现链路一致，
+# arm64 交叉编译不需要给 Dockerfile 添任何东西。
+#
+# ── 为什么不做成可选 feature ────────────────────────────────
+# 容器内「一键更新」下载的是同一个二进制包（agent2api-server-linux-<arch>.tar.gz，
+# 见 core/update/selfupdate.rs）。做成非默认 feature 的话，Dockerfile 与构建仓库
+# 两个地方都得记得传 `--features`，漏一处就会让更新后的容器**静默退回**默认
+# 分配器 —— 这种降级只表现为「内存又涨了」，排查成本极高。按目标自动生效则
+# 任何 `cargo build -p agent2api-server` 都一致，没有可漏配的地方。
+#
+# 落的代码只有 bin/agent2api-server.rs 里那两行 `#[global_allocator]`：桌面端
+# 与 headless 链接的都是本 crate 的库，库不引用这个符号，所以桌面端产物里这份
+# 依赖会被链接器扔掉（仅多花几秒编译）。
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = "0.7"
 
 [dev-dependencies]
 # 路由级测试用 `ServiceExt::oneshot` 直接打 Router（不占端口、不跑 serve），

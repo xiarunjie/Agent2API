@@ -13,8 +13,6 @@ use crate::server::core::update::client::{
 use crate::server::core::update::{compare_versions, is_prerelease_version, source};
 
 pub const INDEX_REPO: &str = "Agent2plugin/Agent2plugin";
-pub const CUSTOM_INDEX_URL: &str =
-    "https://raw.githubusercontent.com/SsuJojo/Agent2Providers/main/.agent2api/index.json";
 pub const FALLBACK_REPO: &str = "Agent2Builder/agent2api-providers-releases";
 const GITHUB_API: &str = "https://api.github.com";
 const QUERY_TIMEOUT_MS: u64 = 30_000;
@@ -40,8 +38,6 @@ pub struct IndexEntry {
     pub description: String,
     pub official: bool,
     pub require_signed: bool,
-    pub author: Option<String>,
-    pub index_url: Option<String>,
     pub manifest: String,
     pub icon: String,
     pub repo: String,
@@ -52,8 +48,6 @@ pub struct PluginDetail {
     pub protocol: u32,
     pub repo: String,
     pub tag_template: String,
-    /// 备用 tag 模板（如 beta 线的 `v{version}-fork-beta.{run}`）。
-    pub alt_tag_templates: Vec<String>,
     pub asset_template: String,
     pub homepage: String,
     pub require_signed: bool,
@@ -149,9 +143,22 @@ async fn fetch(url: &str) -> Result<reqwest::Response, String> {
     Ok(response)
 }
 
-async fn parse_index(value: Value, official: bool, index_url: Option<&str>) -> Result<Vec<IndexEntry>, String> {
-    let require_signed = !official;
-    let items = value
+pub async fn read_index_result() -> Result<Vec<IndexEntry>, String> {
+    let url = format!("https://raw.githubusercontent.com/{INDEX_REPO}/main/index.json");
+    let response = fetch_json(&url, &github_headers(), QUERY_TIMEOUT_MS, |value| {
+        value.get("plugins").and_then(Value::as_array).is_some()
+    })
+    .await
+    .map_err(|error| describe_error(&error.message, 0))?;
+    if !response.status.is_success() {
+        return Err(format!(
+            "读取插件索引失败：HTTP {}",
+            response.status.as_u16()
+        ));
+    }
+    let require_signed = !response.official;
+    let document = response.value;
+    let items = document
         .get("plugins")
         .and_then(Value::as_array)
         .ok_or_else(|| "插件索引缺少 plugins 数组".to_string())?;
@@ -167,26 +174,12 @@ async fn parse_index(value: Value, official: bool, index_url: Option<&str>) -> R
                 return None;
             }
             let name = text(item, "name");
-            let author = item
-                .get("author")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_string);
             Some(IndexEntry {
                 name: if name.is_empty() { id.clone() } else { name },
                 id,
                 description: text(item, "description"),
-                official: official && item.get("official").and_then(Value::as_bool) == Some(true),
+                official: item.get("official").and_then(Value::as_bool) == Some(true),
                 require_signed,
-                author: author.or_else(|| {
-                    (!official).then(|| {
-                        index_url
-                            .and_then(|url| url::Url::parse(url).ok())
-                            .and_then(|url| url.path().split('/').nth(1).map(str::to_string))
-                            .unwrap_or_else(|| "第三方".to_string())
-                    })
-                }),
-                index_url: index_url.map(str::to_string),
                 manifest: text(item, "manifest"),
                 icon: text(item, "icon"),
                 repo: item
@@ -198,50 +191,11 @@ async fn parse_index(value: Value, official: bool, index_url: Option<&str>) -> R
         .collect())
 }
 
-async fn read_custom_index_result() -> Option<Vec<IndexEntry>> {
-    let response = fetch_json(CUSTOM_INDEX_URL, &github_headers(), QUERY_TIMEOUT_MS, |value| {
-        value.get("plugins").and_then(Value::as_array).is_some()
-    })
-    .await
-    .ok()?;
-    if !response.status.is_success() {
-        return None;
-    }
-    let index_url = CUSTOM_INDEX_URL
-        .rsplit_once('/')
-        .map(|(base, _)| format!("{base}/"));
-    parse_index(response.value, false, index_url.as_deref())
-        .await
-        .ok()
-}
-
-pub async fn read_index_result() -> Result<Vec<IndexEntry>, String> {
-    let url = format!("https://raw.githubusercontent.com/{INDEX_REPO}/main/index.json");
-    let response = fetch_json(&url, &github_headers(), QUERY_TIMEOUT_MS, |value| {
-        value.get("plugins").and_then(Value::as_array).is_some()
-    })
-    .await
-    .map_err(|error| describe_error(&error.message, 0))?;
-    if !response.status.is_success() {
-        return Err(format!(
-            "读取插件索引失败：HTTP {}",
-            response.status.as_u16()
-        ));
-    }
-    let base_url = url.rsplit_once('/').map(|(base, _)| format!("{base}/"));
-    let mut entries =
-        parse_index(response.value, response.official, base_url.as_deref()).await?;
-    if let Some(custom) = read_custom_index_result().await {
-        entries.extend(custom);
-    }
-    Ok(entries)
-}
-
 pub async fn read_index() -> Vec<IndexEntry> {
     read_index_result().await.unwrap_or_default()
 }
 
-fn index_path(base_url: Option<&str>, path: &str) -> Option<String> {
+fn index_path(path: &str) -> Option<String> {
     if path.is_empty()
         || path.starts_with('/')
         || path.contains('\\')
@@ -250,22 +204,14 @@ fn index_path(base_url: Option<&str>, path: &str) -> Option<String> {
     {
         return None;
     }
-    Some(match base_url {
-        Some(base) => {
-            let base = base.trim_end_matches('/');
-            format!("{base}/{path}")
-        }
-        None => format!("https://raw.githubusercontent.com/{INDEX_REPO}/main/{path}"),
-    })
+    Some(format!(
+        "https://raw.githubusercontent.com/{INDEX_REPO}/main/{path}"
+    ))
 }
 
 pub async fn read_detail(path: &str) -> Option<PluginDetail> {
-    read_detail_in(None, path).await
-}
-
-pub async fn read_detail_in(base_url: Option<&str>, path: &str) -> Option<PluginDetail> {
     let response = fetch_json(
-        &index_path(base_url, path)?,
+        &index_path(path)?,
         &github_headers(),
         QUERY_TIMEOUT_MS,
         |value| value.is_object() && value.get("release").is_some_and(Value::is_object),
@@ -287,18 +233,6 @@ pub async fn read_detail_in(base_url: Option<&str>, path: &str) -> Option<Plugin
             .map(|value| text(value, "tag"))
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "v{version}".to_string()),
-        alt_tag_templates: release
-            .and_then(|value| value.get("altTags"))
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .filter(|value| !value.trim().is_empty())
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default(),
         asset_template: release
             .map(|value| text(value, "asset"))
             .filter(|value| !value.is_empty())
@@ -309,11 +243,7 @@ pub async fn read_detail_in(base_url: Option<&str>, path: &str) -> Option<Plugin
 }
 
 pub async fn read_store_icon(path: &str) -> Option<String> {
-    read_store_icon_in(None, path).await
-}
-
-pub async fn read_store_icon_in(base_url: Option<&str>, path: &str) -> Option<String> {
-    let response = fetch(&index_path(base_url, path)?).await.ok()?;
+    let response = fetch(&index_path(path)?).await.ok()?;
     if !response.status().is_success() || response.content_length().unwrap_or(0) > 2 * 1024 * 1024 {
         return None;
     }
@@ -347,35 +277,9 @@ fn valid_repo(repo: &str) -> bool {
 
 fn release_version(release: &Value, template: &str) -> Option<String> {
     let tag = text(release, "tag_name");
-    let version_at = template.find("{version}")?;
-    let Some(run_at) = template.find("{run}") else {
-        let prefix = &template[..version_at];
-        let suffix = &template[version_at + "{version}".len()..];
-        let version = tag.strip_prefix(prefix)?.strip_suffix(suffix)?;
-        return compare_versions(version, version).map(|_| version.to_string());
-    };
-    let (prefix, middle, tail, run_first) = if run_at < version_at {
-        let middle = &template[run_at + "{run}".len()..version_at];
-        let tail = &template[version_at + "{version}".len()..];
-        (&template[..run_at], middle, tail, true)
-    } else {
-        let middle = &template[version_at + "{version}".len()..run_at];
-        let tail = &template[run_at + "{run}".len()..];
-        (&template[..version_at], middle, tail, false)
-    };
-    let rest = tag.strip_prefix(prefix)?.strip_suffix(tail)?;
-    let (left, right) = rest.split_once(middle)?;
-    let (version, run) = if run_first {
-        (right, left)
-    } else {
-        (left, right)
-    };
-    if compare_versions(version, version).is_none() {
-        return None;
-    }
-    if run.is_empty() || !run.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
+    let (prefix, suffix) = template.split_once("{version}")?;
+    let version = tag.strip_prefix(prefix)?.strip_suffix(suffix)?;
+    compare_versions(version, version)?;
     Some(version.to_string())
 }
 
@@ -384,21 +288,10 @@ fn pick_release_assets(
     id: &str,
     detail: Option<&PluginDetail>,
 ) -> Option<ReleaseAssets> {
-    let templates = detail
-        .map(|detail| {
-            let mut templates = vec![detail.tag_template.clone()];
-            templates.extend(detail.alt_tag_templates.iter().cloned());
-            templates
-        })
-        .unwrap_or_else(|| vec!["v{version}".to_string()]);
-    let mut version = None;
-    for template in &templates {
-        if let Some(parsed) = release_version(release, template) {
-            version = Some(parsed);
-            break;
-        }
-    }
-    let version = version?;
+    let tag = detail
+        .map(|detail| detail.tag_template.as_str())
+        .unwrap_or("v{version}");
+    let version = release_version(release, tag)?;
     let template = detail
         .map(|detail| detail.asset_template.as_str())
         .unwrap_or("{id}-{version}-{target}.zip")
@@ -774,53 +667,5 @@ mod tests {
         let asset = pick_asset(&release, "agent2api-providers", "x86_64-unknown-linux-gnu")
             .expect("应当挑到 Linux 包");
         assert_eq!(asset.version, "1.2.3");
-    }
-
-    #[test]
-    fn parses_fork_run_tag_template() {
-        let release = json!({
-            "tag_name": "v0.2.1-fork.17",
-            "assets": [
-                { "name": "ssujojo-providers-0.2.1-x86_64-pc-windows-msvc.zip",
-                  "browser_download_url": "https://example.com/a.zip", "size": 100 }
-            ]
-        });
-        let detail = PluginDetail {
-            protocol: 1,
-            repo: "SsuJojo/Agent2Providers".to_string(),
-            tag_template: "v{version}-fork.{run}".to_string(),
-            alt_tag_templates: Vec::new(),
-            asset_template: "{id}-{version}-{target}.zip".to_string(),
-            homepage: String::new(),
-            require_signed: true,
-        };
-        let assets = pick_release_assets(&release, "ssujojo-providers", Some(&detail))
-            .expect("应当解析 fork run tag");
-        assert_eq!(assets.version, "0.2.1");
-        assert_eq!(assets.platforms.len(), 1);
-    }
-
-    #[test]
-    fn parses_fork_beta_run_tag_template() {
-        let release = json!({
-            "tag_name": "v3.3.0-beta.6-fork-beta.3",
-            "assets": [
-                { "name": "ssujojo-providers-3.3.0-beta.6-x86_64-pc-windows-msvc.zip",
-                  "browser_download_url": "https://example.com/beta.zip", "size": 100 }
-            ]
-        });
-        let detail = PluginDetail {
-            protocol: 1,
-            repo: "SsuJojo/Agent2Providers".to_string(),
-            tag_template: "v{version}-fork.{run}".to_string(),
-            alt_tag_templates: vec!["v{version}-fork-beta.{run}".to_string()],
-            asset_template: "{id}-{version}-{target}.zip".to_string(),
-            homepage: String::new(),
-            require_signed: true,
-        };
-        let assets = pick_release_assets(&release, "ssujojo-providers", Some(&detail))
-            .expect("应当解析 fork-beta run tag");
-        assert_eq!(assets.version, "3.3.0-beta.6");
-        assert_eq!(assets.platforms.len(), 1);
     }
 }

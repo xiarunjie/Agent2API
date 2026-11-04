@@ -1608,10 +1608,11 @@ pub fn shim_js() -> &'static str {
     setModelState: function (payload) { return call('POST', '/api/models/state', payload); },
     // 第 4 / 第 5 个参数（思考等级 / 映射开关）都按「有没有传」决定是否进请求体：
     // 后端按「请求体里有没有这个键」区分三态，undefined 的键不会进 JSON
-    addModelMapping: function (alias, target, provider, reasoning, enabled) {
+    addModelMapping: function (alias, target, provider, reasoning, enabled, create) {
       var payload = { alias: alias, target: target, provider: provider };
       if (reasoning !== undefined) payload.reasoning = reasoning;
       if (enabled !== undefined) payload.enabled = enabled;
+      if (create !== undefined) payload.create = create;
       return call('POST', '/api/models/mappings', payload);
     },
     removeModelMapping: function (alias, target, provider) {
@@ -1690,6 +1691,7 @@ pub fn shim_js() -> &'static str {
     getRoutingSticky: function (model) { return call('GET', '/api/routing/sticky' + toQuery({ model: model })); },
     clearRoutingSticky: function (payload) { return call('POST', '/api/routing/sticky/clear', payload || {}); },
     getRoutingReplays: function (query) { return call('GET', '/api/routing/replays' + toQuery(query)); },
+    getRoutingFlow: function (query) { return call('GET', '/api/routing/flow' + toQuery(query)); },
     getRoutingTrace: function (query) { return call('GET', '/api/routing/trace' + toQuery(query)); },
     getRoutingTraceRequest: function (query) { return call('GET', '/api/routing/trace/request' + toQuery(query)); },
     setRoutingConfig: function (patch) { return call('PUT', '/api/routing', patch || {}); },
@@ -2142,6 +2144,10 @@ pub fn shim_js() -> &'static str {
     // ── 排队等待（次数 / 单次秒数）──
     getQueue: function () { return call('GET', '/api/queue'); },
     saveQueue: function (patch) { return call('PUT', '/api/queue', patch); },
+    // ── 会话图片压缩（开关 + 长边 / 质量 / 阈值三项）──
+    // 与桌面桥（src/bridge.rs 的 getImageCompress / saveImageCompress）逐字同形。
+    getImageCompress: function () { return call('GET', '/api/image-compress'); },
+    saveImageCompress: function (patch) { return call('PUT', '/api/image-compress', patch); },
     // ── 验证码令牌池（ZCode 活动套餐通道的补货节奏）──
     getCaptchaPool: function () { return call('GET', '/api/zcode/captcha-pool'); },
     saveCaptchaPool: function (patch) { return call('PUT', '/api/zcode/captcha-pool', patch); },

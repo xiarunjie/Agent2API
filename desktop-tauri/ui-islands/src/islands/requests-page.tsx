@@ -20,6 +20,7 @@ import { Empty } from '@ui'
 import { ALL_CLIENTS, clientFilterValue, LogDateFilters, SourceLogFilters, sourceParams,
   type LogDates, type LogDrilldown, type SourceOption } from './requests/source-filters'
 import { RequestCell, headRow, isOk, isRunning, uniqueRowKeys, providerLabelOf, type RequestEntry, type VisibleColumn } from './requests/request-cells'
+import { getStore as getAccountsStore, subscribe as subscribeAccounts } from './accounts-store'
 import { phaseOf, phaseLabelOf, phaseElapsedText, phaseBadgeHtml, phaseElapsedLineHtml } from './requests/request-phase'
 
 type RequestQueryResult = {
@@ -105,6 +106,7 @@ const COLUMNS: Column[] = [
   { key: 'apiKey', label: t('API Key'), sel: '.req-api-key', track: '140px' },
   { key: 'dur', label: t('用时'), sel: '.req-dur', track: '96px', align: 'right' },
   { key: 'speed', label: t('速度'), sel: '.req-speed', track: '96px', align: 'center', legacyAlign: 'right' },
+  { key: 'credit', label: t('积分'), sel: '.req-credit', track: '72px', align: 'center' },
   { key: 'usage', label: t('用量'), sel: '.req-usage', track: 'minmax(0, 1.6fr)' },
   { key: 'error', label: t('错误'), sel: '.req-error-cell', track: 'minmax(0, 1.2fr)' },
   { key: 'detail', label: t('详情'), sel: '.req-detail', track: '60px', align: 'right' },
@@ -342,6 +344,7 @@ function emptyText(data: PanelData): string {
 }
 
 function RequestsPage() {
+  const namesHidden = React.useSyncExternalStore(subscribeAccounts, () => getAccountsStore().namesHidden)
   const [data, setData] = React.useState<PanelData>(EMPTY_DATA)
   const [filters, setFilters] = React.useState<Filters>(() => readSavedFilters())
   const [range, setRange] = React.useState<string>(() => current.range)
@@ -585,7 +588,7 @@ function RequestsPage() {
   const rowKeys = uniqueRowKeys(data.entries)
   const rows = data.entries.map((entry, index) => (
     <div key={rowKeys[index]} className={`req-row${isRunning(entry) ? ' running' : isOk(entry) ? '' : ' failed'}`}>
-      {columns.map(column => <RequestCell key={column.key} entry={entry} column={column} />)}
+      {columns.map(column => <RequestCell key={column.key} entry={entry} column={column} namesHidden={namesHidden} />)}
     </div>
   ))
 
@@ -674,7 +677,7 @@ function RequestsPage() {
           {data.error
             ? <Empty className='log-empty'>{data.error}</Empty>
             : data.entries.length
-              ? [headRow(columns), ...rows]
+              ? [headRow(columns, namesHidden), ...rows]
               : <Empty className='log-empty'>{emptyText(data)}</Empty>}
         </div>
       </CardContent>

@@ -296,8 +296,15 @@ pub(crate) fn apply(db: &Db, snapshot: &Snapshot) -> Result<Value, String> {
         ));
     }
 
-    db.with_mut(|conn| apply_conn(conn, snapshot))
-        .ok_or_else(|| "数据库连接不可用，无法应用同步快照".to_string())?
+    let applied = db.with_mut(|conn| {
+        db.invalidate_accounts();
+        let applied = apply_conn(conn, snapshot);
+        db.invalidate_accounts();
+        applied
+    })
+        .ok_or_else(|| "数据库连接不可用，无法应用同步快照".to_string())?;
+    db.invalidate_accounts();
+    applied
 }
 
 fn apply_conn(conn: &mut Connection, snapshot: &Snapshot) -> Result<Value, String> {
@@ -443,13 +450,6 @@ pub(crate) fn safety_backup(snapshot: &Snapshot, config_dir: &std::path::Path) -
         let _ = std::fs::remove_file(&tmp);
         format!("保存安全备份失败: {error}")
     })?;
-    // 与整库恢复的 pre-restore-* 同一套保留上限：自动同步会在每次下载前写一份，
-    // 不清理的话磁盘占用随下载次数线性增长。留 2 份足够覆盖「这次也错了」。
-    crate::server::db::backup::retention::prune_backups(
-        &dir,
-        crate::server::db::backup::retention::BackupKind::CloudSync,
-        2,
-    );
     Ok(name)
 }
 

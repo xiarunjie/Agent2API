@@ -1,6 +1,6 @@
 import { PageHead, SectionHead, IconButton } from '../components/ui'
 import { Icon, type IconName } from '../components/Icon'
-import { store, useStore, type ThemeMode } from '../state/store'
+import { store, useStore } from '../state/store'
 import { apiBase, baseLabel } from '../lib/servers'
 import { isRateLimited } from '../lib/format'
 import { usePullToRefresh, PullIndicator } from '../components/PullToRefresh'
@@ -71,9 +71,9 @@ export function MorePage() {
               <div style={{ padding: '0 20px 4px', fontSize: 11.5, fontWeight: 600, color: 'var(--m-text-3)', letterSpacing: '.02em' }}>
                 {group.title}
               </div>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 4, padding: '4px 10px 10px' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 4, padding: '4px 10px 10px' }}>
                 {group.entries.map(entry => (
-                  <Button size='default' variant='ghost'
+                  <Button size='default' variant='ghost' className='h-auto min-w-0 whitespace-normal'
                     key={entry.id}
                     type='button'
                     onClick={() => store.push(entry.id)}
@@ -92,6 +92,7 @@ export function MorePage() {
                     }}
                   >
                     <span
+                      className='shrink-0'
                       style={{
                         width: 44,
                         height: 44,
@@ -193,16 +194,14 @@ export function MorePage() {
   )
 }
 
-/** 主题五档：跟随系统 / 浅色 / 深色 / 枫叶·白 / 枫叶·黑（与桌面端设置页同一份取值） */
+/** 主题三档：跟随系统 / 浅色 / 深色 */
 export function ThemeSwitch() {
   const { theme } = useStore()
-  const options: Array<{ value: ThemeMode; label: string }> = [
+  const options: Array<{ value: 'system' | 'light' | 'dark'; label: string }> = [
     { value: 'system', label: t('系统') },
     { value: 'light', label: t('浅色') },
     { value: 'dark', label: t('深色') },
-    { value: 'maple-light', label: t('枫叶·白') },
-    { value: 'maple-dark', label: t('枫叶·黑') },
   ]
   return <SegmentedControl options={options} value={theme} aria-label={t('主题')}
-    onValueChange={value => store.setTheme(value)} />
+    onValueChange={value => store.setTheme(value as 'system' | 'light' | 'dark')} />
 }

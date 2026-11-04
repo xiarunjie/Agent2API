@@ -34,6 +34,8 @@ import * as React from 'react'
 import {
   CATEGORIES,
   CAPTCHA_POOL_FIELDS,
+  IMAGE_COMPRESS_ENABLED_KEY,
+  IMAGE_COMPRESS_FIELDS,
   NO_RETRY_CODES_KEY,
   PROMPT_MODES,
   QUEUE_FIELDS,
@@ -84,6 +86,7 @@ export type BusyScope =
   | 'codes'
   | 'timeouts'
   | 'queue'
+  | 'imageCompress'
   | 'captchaPool'
   | 'routing'
   | 'debug'
@@ -157,6 +160,17 @@ export type DebugState = {
 
 /** 开发者角色兼容开关 */
 export type DeveloperRoleCompatState = { status: LoadStatus; on: boolean }
+
+/**
+ * 会话图片压缩：一个开关 + 三项参数。`values` 为 null（loading / unavailable）
+ * 时三个输入框保持禁用；`enabled` 在读到之前按关显示（与 developerRoleCompat
+ * 同款降级口径）。
+ */
+export type ImageCompressState = {
+  status: LoadStatus
+  enabled: boolean
+  values: Record<string, number> | null
+}
 
 /** Cline 伪装头：三份表（默认 / 覆盖 / 生效）都来自后端，界面据此渲染与判断改动 */
 export type ClineHeadersState = {
@@ -265,16 +279,6 @@ export type StorageState = {
   dailyDays: number | null
   downstreamRaw: number | null
   upstreamRaw: number | null
-  /**
-   * 库内空闲页占用的字节数（压缩一次能还给文件系统多少）。
-   *
-   * `auto_vacuum=0` 下删除行只把页标成空闲，库文件**不会**缩小 —— 用户会看到
-   * 「库里没多少数据、文件却有几个 GB」。这是实测「C 盘爆满」最容易被误读成
-   * 「程序偷偷占盘」的那一项，所以单独露出来，而不是只给一个总占用。
-   */
-  reclaimableBytes: number
-  /** 空闲页占比（0..1，后端保留三位小数）。0 = 没有可回收空洞。 */
-  freePageRatio: number
 }
 
 /** 导入失败明细（只列前 3 条，more 表示还有更多） */
@@ -294,6 +298,8 @@ export type SettingsSnapshot = {
   retryCodes: number[] | null
   timeouts: NumericState
   queue: NumericState
+  /** 会话图片压缩：开关 + 三项参数（长边 / 质量 / 阈值） */
+  imageCompress: ImageCompressState
   captchaPool: NumericState
   /** 账号路由：策略 + 会话粘性（「路由」分类） */
   routing: RoutingState
@@ -432,6 +438,7 @@ const INITIAL: SettingsSnapshot = {
   retryCodes: null,
   timeouts: { status: 'loading', values: null },
   queue: { status: 'loading', values: null },
+  imageCompress: { status: 'loading', enabled: true, values: null },
   captchaPool: { status: 'loading', values: null },
   routing: { status: 'loading', strategy: 'order', sticky: 'auto', failoverBackoff: true, sink: true, breakerEnabled: false },
   debug: { status: 'loading', on: false, count: null, limit: null },
@@ -466,8 +473,6 @@ const INITIAL: SettingsSnapshot = {
     dailyDays: null,
     downstreamRaw: null,
     upstreamRaw: null,
-    reclaimableBytes: 0,
-    freePageRatio: 0,
   },
   captcha: { available: true, desktop: false, web: false, localPanel: false },
   account: { status: 'loading', registered: false, username: '', password: null },
@@ -1367,7 +1372,7 @@ async function commitRetention(field: RetentionField, value: number, shrinking: 
  * 直接换号」名单）由各自的代码实现，在数据到达 / 不可用时被回调一次。
  */
 type NumericPanel = {
-  scope: 'retry' | 'timeouts' | 'queue' | 'captchaPool'
+  scope: 'retry' | 'timeouts' | 'queue' | 'imageCompress' | 'captchaPool'
   fields: NumberField[]
   consoleLabel: string
   /** 取数 / 写回：桥不在时给 undefined（各调用点按「读不到」处理） */
@@ -1449,6 +1454,64 @@ export async function loadQueue(): Promise<void> {
 
 export async function saveQueueField(field: NumberField, raw: string): Promise<void> {
   await saveNumericField(queuePanel, field, raw)
+}
+
+/* ─── 会话图片压缩（开关 + 三项参数）────────────── */
+
+/** 从响应里读开关（非对象 / 字段不是字面 true 都算关，与后端「只认字面 true」一致） */
+function imageCompressEnabledFlag(data: unknown): boolean {
+  if (!data || typeof data !== 'object') return false
+  return (data as Record<string, unknown>)[IMAGE_COMPRESS_ENABLED_KEY] === true
+}
+
+/**
+ * 图片压缩面板：三项数字复用数字面板的取数 / 写入 / 回滚流程；开关另走一条
+ * 只改一个布尔值的保存路径（与 developerRoleCompat 同款）。两者共用同一条
+ * `/api/image-compress` 端点，响应里同时带开关与三项参数。
+ */
+const imageCompressPanel: NumericPanel = {
+  scope: 'imageCompress',
+  fields: IMAGE_COMPRESS_FIELDS,
+  consoleLabel: '读取会话图片压缩设置',
+  get: () => shared().workbuddyDesktop?.getImageCompress(),
+  save: patch => shared().workbuddyDesktop?.saveImageCompress(patch),
+  read: () => ({ status: snapshot.imageCompress.status, values: snapshot.imageCompress.values }),
+  write: state => publish({
+    imageCompress: { ...snapshot.imageCompress, status: state.status, values: state.values },
+  }),
+  // 同一份响应里还带开关；数字面板不认布尔值，这里顺手回写
+  syncExtras: data => {
+    publish({ imageCompress: { ...snapshot.imageCompress, enabled: imageCompressEnabledFlag(data) } })
+  },
+}
+
+export function renderImageCompress(data?: unknown): void {
+  renderNumericPanel(imageCompressPanel, data)
+}
+
+export async function loadImageCompress(): Promise<void> {
+  await loadNumericPanel(imageCompressPanel)
+}
+
+export async function saveImageCompressField(field: NumberField, raw: string): Promise<void> {
+  await saveNumericField(imageCompressPanel, field, raw)
+}
+
+/** 开关的保存路径（只改一个布尔值；失败回滚到后端真实值） */
+export async function saveImageCompressEnabled(next: boolean): Promise<void> {
+  if (busyScope) { repaint(); return }
+  beginBusy('imageCompress')
+  publish({ imageCompress: { ...snapshot.imageCompress, enabled: next } })
+  try {
+    const saved = await shared().workbuddyDesktop?.saveImageCompress({ [IMAGE_COMPRESS_ENABLED_KEY]: next })
+    renderImageCompress(saved)
+    toast(next ? t('✅ 会话图片压缩已开启') : t('已关闭会话图片压缩'))
+  } catch (error) {
+    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
+    await loadImageCompress() // 回滚到后端的真实值
+  } finally {
+    endBusy()
+  }
 }
 
 /* ─── 验证码令牌池 ─────────────────────────── */
@@ -2574,8 +2637,7 @@ function finiteOrNull(value: unknown): number | null {
 
 /**
  * 渲染概况。形状是后端的**单库语义**：
- * `{ configDir, database: { file, bytes, reclaimableBytes, freePageRatio, available,
- *   accounts, logs, requests, dailyDays, downstreamRaw, upstreamRaw } }`。
+ * `{ configDir, database: { file, bytes, available, accounts, logs, requests, dailyDays, downstreamRaw, upstreamRaw } }`。
  * 后端起不来（网络 / 桥失败）与库打不开是两件事，但对这一页的结论相同：读不到存储概况就
  * 展示「不可用」而不是一排看着正常的 0。
  */
@@ -2601,10 +2663,6 @@ export function renderStorage(data?: unknown): void {
       dailyDays: finiteOrNull(record.dailyDays),
       downstreamRaw: finiteOrNull(record.downstreamRaw),
       upstreamRaw: finiteOrNull(record.upstreamRaw ?? record.debug),
-      // 空洞读数：老后端没有这两个字段时回落 0（= 不显示「可回收」），
-      // 而不是让视图去猜一个 undefined。
-      reclaimableBytes: finiteOrNull(record.reclaimableBytes) ?? 0,
-      freePageRatio: finiteOrNull(record.freePageRatio) ?? 0,
     },
   })
 }
@@ -2660,6 +2718,7 @@ export async function load(): Promise<void> {
     loadRetry(),
     loadTimeouts(),
     loadQueue(),
+    loadImageCompress(),
     loadCaptchaPool(),
     loadDebug(),
     loadSanitize(),
@@ -2701,6 +2760,11 @@ export async function refreshTimeouts(): Promise<void> {
 export async function refreshQueue(): Promise<void> {
   await loadQueue()
   toast(t('排队等待设置已刷新'))
+}
+
+export async function refreshImageCompress(): Promise<void> {
+  await loadImageCompress()
+  toast(t('会话图片压缩设置已刷新'))
 }
 
 export async function refreshCaptchaPool(): Promise<void> {

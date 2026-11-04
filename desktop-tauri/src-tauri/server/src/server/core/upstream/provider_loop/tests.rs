@@ -72,17 +72,6 @@ async fn mock_upstream(
 
 static TEMP_SEQ: AtomicUsize = AtomicUsize::new(0);
 
-/// 下一个北京零点的毫秒时刻（与插件的 `codearts::welfare::next_day_boundary_ms`
-/// 同一口径：固定 UTC+8，不跟机器时区）。
-fn next_beijing_midnight(now_ms: i64) -> i64 {
-    const DAY_MS: i64 = 24 * 60 * 60 * 1000;
-    let offset_ms = i64::from(crate::server::core::beijing::OFFSET_SECONDS) * 1000;
-    let shifted = now_ms.saturating_add(offset_ms);
-    (shifted.div_euclid(DAY_MS) + 1)
-        .saturating_mul(DAY_MS)
-        .saturating_sub(offset_ms)
-}
-
 /// 临时库目录，Drop 时删除。
 ///
 /// 刻意不在建库前删了事：文件名带 pid，下一轮 pid 变了就永远删不到（曾在一台机器上
@@ -201,43 +190,43 @@ fn stateful_quota_bookkeeping_ignores_non_quota_classes() {
 
 #[test]
 fn codearts_daily_pool_envelope_cools_to_the_boundary_instead_of_ten_minutes() {
-    // 3.3.0-beta 系把 CodeArts 的转发与错误分类搬进了插件仓库（ProvidersPlugin）。
-    // 网关侧不再内置它的 `classify_conversation_error`：插件缺位时适配器回落
-    // `missing_plugin`，一切错误都分类为 Fatal —— 这条用例钉的「4291.200 → 日池
-    // 零点冷却」语义随实现搬去了插件侧，在网关这里无从断言。保留用例骨架并在
-    // 插件缺位时跳过，插件在场（装了 ProvidersPlugin 并注册 CodeArts）时仍照常
-    // 钉语义。
     use crate::server::errors::GatewayError;
 
-    let (_dir, _service, _id) = temp_service();
+    let (_dir, service, id) = temp_service();
+    // 生产库里那条真实文案（HTTP 200 的 SSE 里折出 403，首包门送进会话式分支）
     let error = GatewayError::with_status(403, "上游报告 InferHub.4291.200：insufficient quota");
-    // ── 分类走**插件错误投影**，不走 `adapter_for` ────────────────
-    // 迁移完成后 `adapter_for` 只返回「未安装插件」的占位适配器（它的
-    // `classify_conversation_error` 恒为 Fatal，且文案是「请安装插件」）——
-    // 真实的 CodeArts 分类在插件里，经 `strict_errors::conversation` 投影回宿主
-    // 的 `conversation_class`。这条用例要钉的是**那条真实链路**：日池耗尽的
-    // 403 必须带北京零点，否则存储层落到 10 分钟兜底、账号被反复白撞。
-    let class = crate::server::core::plugin_host::projected_conversation_class(
-        "codearts",
-        &crate::server::core::plugin_host::projected_conversation_error(
-            "codearts",
-            403,
-            UpstreamErrorClass::QuotaLimited {
-                // 插件算出的日池重置点（`codearts::adapter::daily_pool_reset_at`
-                // → `welfare::next_day_boundary_ms`）。这里就地复算同一个值：
-                // 宿主侧不该依赖插件实现，测试只要能证明「这个时刻被原样保住」。
-                reset_at: Some(next_beijing_midnight(logging::now_ms())),
-                message: error.message.clone(),
-                upstream_code: None,
-                status: 403,
-            },
-            &json!({"error_msg": "InferHub.4291.200", "message": "insufficient quota"}),
-            None,
-        ),
-    );
+    let class = adapter_for(ProviderKind::CodeArts).classify_conversation_error(&error);
     let UpstreamErrorClass::QuotaLimited { reset_at: Some(reset_at), .. } = &class else {
         panic!("福利池耗尽的文案应分类为带恢复时刻的 QuotaLimited，实际 {class:?}");
     };
+    mark_conversation_limited(&service, &id, &single("glm-5.3-flash"), &class, &error.message);
+
+    let stored = rotate::account_limit_reset_at(&service, &id, "glm-5.3-flash");
+    assert_eq!(stored, *reset_at, "落库的恢复时刻必须是适配器算出的日池重置点");
+    // ── 断言「是下一个北京零点」，而不是「距现在 > 10 分钟」（2026-10-13 修）──
+    //
+    // 原断言写的是 `minutes > 10`，本意是「不是 10 分钟兜底常量」；但它有个
+    // 时变缺陷：日池重置点就是**下一个北京零点**，于是每天 23:50–00:00 这十分钟
+    // 里「距零点」天然小于 10 分钟，用例必然变红（实测 2026-10-13 23:49 撞上）。
+    // 那是测试写法的问题，不是实现的 —— 与兜底常量无关的失败被报成了兜底。
+    //
+    // 改成直接钉住真正的判据：恢复时刻必须落在**当天或次日的北京零点**上，
+    // 且距现在不超过 24 小时（日池的语义就是「到零点重置」）。这样任何时刻
+    // 跑都成立，也不再依赖「现在离零点有多远」。
+    let minutes = (stored - logging::now_ms()) / 60_000;
+    assert!(
+        (0..=24 * 60).contains(&minutes),
+        "日池的恢复时刻应当落在 24 小时以内，实际 {minutes} 分钟"
+    );
+    // 判据：恢复时刻在北京时区里必须是 00:00:00 —— 日池按天重置。
+    // 10 分钟兜底常量（now + 10min）落在零点上的概率可忽略，这一条足以把它排除。
+    let at = crate::server::core::beijing::date_time_of_ms(stored).expect("合法时间戳");
+    use chrono::Timelike;
+    assert!(
+        at.hour() == 0 && at.minute() == 0 && at.second() == 0,
+        "恢复时刻必须是北京零点（日池按天重置），实际 {}",
+        at.format("%Y-%m-%d %H:%M:%S")
+    );
 }
 
 #[test]
@@ -327,46 +316,6 @@ fn other_fatal_statuses_still_get_the_fallback_resend() {
     );
 }
 
-/// 413 是「这份字节太大」：**同一家**换账号不会让这份 body 变小。
-///
-/// issue #6 的形状：CatPaw 入口的 openresty 卡在 1 MiB，会话式路径拿到默认
-/// Fatal 后会把队列里每个候选账号都撞一遍同样的 413，客户端白等 N 个往返。
-/// 但字节墙是每家自己的（CodeArts 约 6 MiB、Loomy 约 12 MB），换一家仍可能过，
-/// 所以判据按**家**收窄。
-#[test]
-fn a_payload_bound_failure_does_not_switch_accounts() {
-    assert!(
-        payload_bound_failure(&fatal(413)),
-        "413 必须被认成「与账号无关的体积拒绝」"
-    );
-    // 反面对照：404 换号有意义（别的账号 / 别的家可能有这个模型），
-    // 400 / 429 的语义由上游决定，都不该被这条判据吞掉。
-    for status in [400u16, 404, 429, 500, 502, 503] {
-        assert!(
-            !payload_bound_failure(&fatal(status)),
-            "HTTP {status} 不该被当成体积拒绝（会把正常的换号/重试路径掐掉）"
-        );
-    }
-    assert!(
-        !payload_bound_failure(&UpstreamErrorClass::QuotaLimited {
-            status: 413,
-            message: "限额".to_string(),
-            upstream_code: None,
-            reset_at: None,
-        }),
-        "限额分类有自己的记账与冷却路径，不该被体积判据接管"
-    );
-    // 同家换号无意义 → 拦；跨家换号有意义 → 放行。
-    assert!(
-        payload_bound_blocks_switch("catpaw", "catpaw"),
-        "同一家的另一个账号面对的是同一堵字节墙，不该白撞"
-    );
-    assert!(
-        !payload_bound_blocks_switch("codearts", "catpaw"),
-        "别家的墙更宽（CodeArts 约 6 MiB），跨家回退必须留着"
-    );
-}
-
 /// 端到端：打到真实返回 413 的替身上身，**只发一次**（改造前是 1 + 3 次）。
 #[tokio::test]
 async fn a_real_413_response_is_sent_once_and_handed_back() {
@@ -383,9 +332,8 @@ async fn a_real_413_response_is_sent_once_and_handed_back() {
         &transport,
         &mut budget,
         Some(&capture),
-        &std::sync::Arc::new(RequestTelemetry::new()),
+        &RequestTelemetry::new(),
         false,
-        None,
     )
     .await;
     task.abort();

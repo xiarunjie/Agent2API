@@ -21,8 +21,6 @@ export type PackSummary = {
   entryPresent: boolean
   protocol: number
   homepage?: string | null
-  author?: string | null
-  publisher?: string | null
   icon?: string | null
   providers: PackProvider[]
   host?: HostState
@@ -49,8 +47,6 @@ export type StorePlugin = {
   name: string
   description: string
   official: boolean
-  author?: string | null
-  publisher?: string | null
   version: string | null
   page: string | null
   notes?: string | null
@@ -97,7 +93,7 @@ export type PluginUpdate = {
 export type PluginOperation = {
   id: string
   action: string
-  stage: 'downloading' | 'verifying' | 'installing' | 'done' | 'failed'
+  stage: 'downloading' | 'verifying' | 'waiting' | 'installing' | 'loading' | 'restoring' | 'done' | 'failed'
   active: boolean
   done: boolean
   received: number

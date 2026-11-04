@@ -191,8 +191,7 @@ impl AccountStore {
     /// 上就给出**，前端不必再发第二个请求。计数是各 provider 的账号**总数**
     /// （含禁用账号）—— 与分组标题显示的「N 个账号」口径一致。
     pub fn list_accounts(&self) -> Value {
-        let _guard = self.guard();
-        let state = self.load(&_guard);
+        let state = self.read_state();
         self.snapshot(&state, Visibility::All)
     }
 
@@ -202,8 +201,7 @@ impl AccountStore {
     /// 签到中心、成长页…）。没装插件时插件家的账号不出现 —— 用户明确要的是
     /// 「插件不在，这家就不存在」；数据仍在库里，装上插件原样回来。
     pub fn list_visible_accounts(&self) -> Value {
-        let _guard = self.guard();
-        let state = self.load(&_guard);
+        let state = self.read_state();
         self.snapshot(&state, Visibility::UserFacing)
     }
 
@@ -232,8 +230,7 @@ impl AccountStore {
     /// 节点，天然跳过）。这一条判据实现复用 `proxy_rotate::candidate_ids` ——
     /// 「哪些条目可能被用到」在取用与预建监听器两处必须是同一个答案。
     pub fn referenced_pool_ids(&self) -> std::collections::HashSet<String> {
-        let _guard = self.guard();
-        let state = self.load(&_guard);
+        let state = self.read_state();
         let mut ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         for record in &state.accounts {
             let proxy = record.proxy();
@@ -269,8 +266,7 @@ impl AccountStore {
     /// 按「记录变了就作废旧结论」处理，多作废一条失败提示，比留着一条过期结论
     /// 更轻 —— 用户手点一次查询就能得到新的（见 `usage_query` 的说明）。
     pub fn account_change_times(&self) -> HashMap<String, i64> {
-        let _guard = self.guard();
-        let state = self.load(&_guard);
+        let state = self.read_state();
         state
             .accounts
             .iter()
@@ -488,6 +484,10 @@ impl AccountStore {
         };
         match shaped {
             Value::Object(mut fields) => {
+                for key in ["upstreamCooldownUntil", "upstreamBlockedReason"] {
+                    if let Some(value) = record.get(key) { fields.insert(key.to_string(), value.clone()); }
+                    else { fields.remove(key); }
+                }
                 if !record.has_plugin_secret() {
                     super::plugin_public::credential_fields(record, &mut fields);
                 }
@@ -557,6 +557,9 @@ impl AccountStore {
                     }
                 }
                 fields.insert("checkinAt".to_string(), Value::from(record.checkin_at()));
+                fields.insert("checkedInToday".to_string(), Value::Bool(super::checkin_state::completed(record)));
+                fields.insert("dailyCheckin".to_string(), super::checkin_state::record_status(record)
+                    .cloned().unwrap_or(Value::Null));
                 // 成长中心连登天数（WorkBuddy 国内版；签到后回读落库，见
                 // `AccountStore::mark_streak_days`）。恒为数字键（0 = 还没读到过），
                 // 与 checkinAt 同一理由：界面按数字读，不必判「字段缺失」。
@@ -705,8 +708,7 @@ impl AccountStore {
     /// auth.json，同样算「有凭证」，见 `state.rs` 的说明）。返回值是**排序后**的：
     /// 调用方按序尝试即可，不必自己再排一遍 —— 优先级的相对顺序就是主备顺序。
     pub fn accounts_for_provider(&self, provider: &str) -> Vec<Value> {
-        let _guard = self.guard();
-        let records = self.records_for_provider(&_guard, provider);
+        let records = self.read_provider(provider);
         let mut records: Vec<StoredAccount> = records
             .into_iter()
             .filter(|record| record.enabled() && record.has_credentials())

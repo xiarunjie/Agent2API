@@ -36,6 +36,8 @@
 //! 要么全不成 —— 中断留下「部分账号改了 id、部分没改」的中间态会让同一批
 //! 账号散在两个 provider 组里。
 
+use std::collections::{HashMap, HashSet};
+
 use serde_json::{json, Map, Value};
 
 use crate::server::config;
@@ -85,11 +87,28 @@ impl AccountStore {
             .is_ok()
     }
 
+    pub fn suspend_upstream_account(&self, id: &str, reason: &str) -> Result<(), String> {
+        let guard = self.guard();
+        let mut record = self.record_by_id(&guard, id).ok_or_else(|| "账号不存在".to_string())?;
+        record.set_enabled(false);
+        record.set("upstreamBlockedReason", Value::String(truncate_chars(reason, 300)));
+        record.set_updated_at(logging::now_ms());
+        self.with_conn(&guard, |conn| sql::update_in_place(conn, &record)).map_err(|error| error.to_string())
+    }
+
+    pub fn cooldown_upstream_account(&self, id: &str, until: i64, reason: &str) -> Result<(), String> {
+        let guard = self.guard();
+        let mut record = self.record_by_id(&guard, id).ok_or_else(|| "账号不存在".to_string())?;
+        if until <= logging::now_ms() { return Ok(()); }
+        record.set("upstreamCooldownUntil", Value::from(until));
+        record.set("upstreamBlockedReason", Value::String(truncate_chars(reason, 300)));
+        record.set_updated_at(logging::now_ms());
+        self.with_conn(&guard, |conn| sql::update_in_place(conn, &record)).map_err(|error| error.to_string())
+    }
+
     /// 账号是否被标记为「需要重新登录」（凭证维护据此跳过）。
     pub fn needs_relogin(&self, id: &str) -> bool {
-        let _guard = self.guard();
-        self.record_by_id(&_guard, id)
-            .and_then(|record| record.get("needsRelogin").and_then(Value::as_bool))
+        self.read_record(id).and_then(|record| record.get("needsRelogin").and_then(Value::as_bool))
             .unwrap_or(false)
     }
 
@@ -228,6 +247,11 @@ impl AccountStore {
     ///
     /// 冷却键形态见 `mark_rate_limited`：键在账号记录内，provider 由账号唯一确定。
     pub fn clear_rate_limit(&self, id: &str, model: &str) -> bool {
+        if !self.route_account(id).is_some_and(|account| {
+            account.get("rateLimits").and_then(|limits| limits.get(model)).is_some()
+        }) {
+            return false;
+        }
         let _guard = self.guard();
         let Some(mut record) = self.record_by_id(&_guard, id) else {
             return false;
@@ -260,11 +284,13 @@ impl AccountStore {
         let count = match record.get("rateLimits") {
             Some(Value::Object(limits)) => limits.len(),
             _ => 0,
-        };
+        } + usize::from(record.get("upstreamCooldownUntil").is_some());
         if count == 0 {
             return 0;
         }
         record.remove("rateLimits");
+        record.remove("upstreamCooldownUntil");
+        if record.enabled() { record.remove("upstreamBlockedReason"); }
         record.set_updated_at(logging::now_ms());
         if self
             .with_conn(&_guard, |conn| sql::update_in_place(conn, &record))
@@ -431,6 +457,68 @@ impl AccountStore {
             return Vec::new();
         }
         cleaned
+    }
+
+    /// Trae 历史模型 ID 清理：账号上的限额冷却键、限制器条件里的模型名
+    /// 按目录缓存给出的旧名映射改成原始 ID。
+    ///
+    /// 只处理 provider 为 `trae` 的记录；**只改映射里确实出现过的旧名**，
+    /// 不按后缀猜——上游真名恰好以 `-solo` 结尾时不能被误伤。
+    /// 一次读、一次差异写（与 `migrate_startup` 同一取向）；没有改动时不落库。
+    pub fn migrate_trae_model_ids(&self, mapping: &HashMap<String, String>) -> usize {
+        if mapping.is_empty() {
+            return 0;
+        }
+        let _guard = self.guard();
+        let mut state = self.load(&_guard);
+        let now = logging::now_ms();
+        let mut changed = 0usize;
+        for record in state.accounts.iter_mut() {
+            if !record.provider().eq_ignore_ascii_case("trae") {
+                continue;
+            }
+            let mut touched = false;
+            if let Some(Value::Object(limits)) = record.get("rateLimits").cloned() {
+                let mut next = Map::new();
+                for (key, value) in limits {
+                    let base = mapping.get(&key.trim().to_ascii_lowercase());
+                    if base.is_some() {
+                        touched = true;
+                    }
+                    next.entry(base.cloned().unwrap_or(key)).or_insert(value);
+                }
+                if touched {
+                    if next.is_empty() {
+                        record.remove("rateLimits");
+                    } else {
+                        record.set("rateLimits", Value::Object(next));
+                    }
+                }
+            }
+            for field in ["limiterGroups", "limiters"] {
+                let Some(mut value) = record.get(field).cloned() else {
+                    continue;
+                };
+                if rewrite_models_arrays(&mut value, mapping) {
+                    record.set(field, value);
+                    touched = true;
+                }
+            }
+            if touched {
+                record.set_updated_at(now);
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            if let Err(error) = self.save(&state, &_guard) {
+                logging::log(
+                    "[Accounts]",
+                    &format!("❌ Trae 旧模型 ID 迁移落库失败（下次启动会重试）: {error}"),
+                );
+                return 0;
+            }
+        }
+        changed
     }
 
     /// 记录账号**今天已签到**（登录页那枚按钮据此置灰）。
@@ -1035,5 +1123,49 @@ impl AccountStore {
                 None
             }
         }
+    }
+}
+
+/// 递归改写 `limiterGroups` / `limiters` 里所有 `models` 数组，并去重。
+fn rewrite_models_arrays(value: &mut Value, mapping: &HashMap<String, String>) -> bool {
+    match value {
+        Value::Object(object) => {
+            let mut changed = false;
+            for (key, child) in object.iter_mut() {
+                if key == "models" {
+                    if let Some(items) = child.as_array_mut() {
+                        for item in items.iter_mut() {
+                            if let Some(text) = item.as_str() {
+                                if let Some(base) =
+                                    mapping.get(&text.trim().to_ascii_lowercase())
+                                {
+                                    *item = Value::String(base.clone());
+                                    changed = true;
+                                }
+                            }
+                        }
+                        let before = items.len();
+                        let mut seen = HashSet::new();
+                        items.retain(|item| {
+                            item.as_str()
+                                .map(|text| seen.insert(text.to_ascii_lowercase()))
+                                .unwrap_or(true)
+                        });
+                        changed |= items.len() != before;
+                    }
+                } else if rewrite_models_arrays(child, mapping) {
+                    changed = true;
+                }
+            }
+            changed
+        }
+        Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed |= rewrite_models_arrays(item, mapping);
+            }
+            changed
+        }
+        _ => false,
     }
 }
